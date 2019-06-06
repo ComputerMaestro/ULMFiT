@@ -7,7 +7,8 @@ using InternedStrings   #For using Interned strings
 using DelimitedFiles   # For reading and writing files
 using BSON  ##For saving model weights
 using Flux  #For building models
-using Flux: Tracker, onecold, crossentropy#, onehot
+using Flux: Tracker, onecold, crossentropy, chunk, batch
+using Base.Iterators: partition
 
 # Initializing wegiths between [-1/sqrt(H), 1/sqrt(H)] where H = hidden size
 init_weights(dims...) = randn(Float32, dims...) .* sqrt(Float32(1/1150))
@@ -55,29 +56,27 @@ end
 Flux.@treelike LanguageModel
 
 #Loading corpus and preprocessing steps
+cd(@__DIR__)
 include("WikiText103_DataDeps.jl")
 
-function preprocess(corpuspath::String = joinpath(datadep"WikiText-103", "wiki.train.tokens"))
+function loadCorpus(corpuspath::String = joinpath(datadep"WikiText-103", "wiki.train.tokens"))
     corpus = read(open(corpuspath, "r"), String)
-    sentences = split(lowercase(corpus), '\n')
-    deleteat!(sentences, findall(x -> isequal(x, "")||isequal(x, " ")||(isequal(x[1:2], " =")&&isequal(x[prevind(x, lastindex(x), 1):end], "= ")), sentences))
-    sentences .*= "<eos>"
-    return sentences
+    return tokenize(corpus)
 end
+
+# function hiddenDropout(unit, lm :: LanguageModel)
+#     unit.cell.Wh = lm.hiddenDropout(unit.cell.Wh)
+#     unit.cell.Wi = lm.hiddenDropout(unit.cell.Wi)
+#     return unit
+# end
+
+onehot(wordVect::Vector, vocab::Vector) =
+    oh_repr = broadcast(x -> (x ∈ lm.vocab) ? Flux.onehot(x, vocab) : Flux.onehot("<unk>", vocab), wordVect)
 
 function embeddingDropout(lm :: LanguageModel)
     dropoutMask = rand(size(lm.embedMat)[1], 1) .> lm.embedDropProb
     return lm.embedMat .* dropoutMask
 end
-
-function hiddenDropout(unit, lm :: LanguageModel)
-    unit.cell.Wh = lm.hiddenDropout(unit.cell.Wh)
-    unit.cell.Wi = lm.hiddenDropout(unit.cell.Wi)
-    return unit
-end
-
-onehot(wordVect::Vector, vocab::Vector) =
-    oh_repr = broadcast(x -> (x ∈ lm.vocab) ? Flux.onehot(x, vocab) : Flux.onehot("<unk>", vocab), wordVect)
 
 function embeddings(ohVect::Vector{Flux.OneHotVector}, emDropMat::TrackedArray, lm::LanguageModel)
     embeddings = Array{Bool, 2}(UndefInitializer(), length(lm.vocab), 0)
@@ -88,52 +87,55 @@ end
 TiedEmbeddings(in::TrackedArray, emDropMat::TrackedArray) = emDropMat*in
 
 #Adding "<pad>" keyowrd at the end if the length of the sentence is < bptt
-padding(sentence::Vector{String}, bptt::Integer=70) = (length(sentence) <= bptt) ? cat(sentence, repeat(["<pos>"], bptt-length(sentence)); dims = 1) : sentence[1:bptt]
+function padding(batches::Vector)
+    n = maximum([length(x) for x in batches])
+    return ([length(batch) < n ? cat(batch, repeat(["<pos>"], n-length(batch)); dims = 1) : batch[1:n] for batch in batches], n)
+end
 
-function generator(c::Channel, sentences = sentences; batchsize::Integer=70, bptt::Integer=70)
-    num_sents = Int(floor(length(sentences)/batchsize))
-    for i=1:num_sents
-        batch = tokenize.([sentences[i+Int(num_sents*j)] for j=0:batchsize-1])
-        batch = intern.(padding.(batch, bptt+1))
-        X, Y = broadcast(x -> getindex(x, 1:bptt), batch), broadcast(x -> getindex(x, 2:bptt+1), batch)
-        put!(c, (X, Y))
+# Generator, whenever it is called it gives one mini-batch
+function generator(c::Channel, corpus = corpus; batchsize::Integer=70, bptt::Integer=70)
+    X_total, n = padding(chunk(corpus, batchsize))
+    X_total = [batch(X_total[j][i] for j=1:length(X_total)) for i=1:n]
+    Y_total = collect(partition(X_total[2:end], bptt))
+    X_total = collect(partition(X_total[1:end-1], bptt))
+    for data in zip(X_total, Y_total)
+        put!(c, data)
     end
 end
 
-function loss(x, y)
-    h = softmax(x)
-    loss = crossentropy(h, y)
-    Flux.reset!(lm)
-    return loss
+# objective funciton
+function loss(X, Y)
+    H = softmax.(X)
+    l = sum(crossentropy.(H, Y))
+    Flux.truncate!(lm)
+    return l
 end
 
-Flux.train!((x, y) -> loss(x, y, lm))
-
-function train!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
+function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
     gradient_clip::Float64=0.25, initLearnRate::Number=30; epochs::Integer=1)
 
-    sentences = preprocess()
-    gen = Channel(x -> generator(x, sentences; batchsize = batchsize, bptt = bptt))
+    sentences = loadCorpus()
+    gen = Channel(x -> generator(x, corpus; batchsize = batchsize, bptt = bptt))
+    opt = Descent(initLearnRate)
     for epoch=1:epochs
         X, Y = take!(gen)
         X, Y = broadcast(x -> onehot(x, lm.vocab), X), broadcast(y -> hcat(onehot(y, lm.vocab)...), Y)
 
+        # FORWARD
         emDropMat = embeddingDropout(lm)
         X = broadcast(x -> embeddings(x, emDropMat, lm), X)    #vector of matrices of embeddings of input sentences
         X = lm.wordDropout.(X)
         X = lm.RecurrentLayers.(X) #outputMat is a vector of matrices of output sentences
-        X = TiedEmbeddings(X, emDropMat)
+        X = broadcast(x -> TiedEmbeddings(x, emDropMat), X)
 
-        grads = broadcast((x, y) -> Tracker.gradient(() -> loss(x, y), params(lm)), X, Y)
-        for i=1:batchsize
-            update!(lm.embedMat, -lr .* grads[lm.embedMat])
-            for cell in [lm.lstmLayer1.cell, lm.lstmlayer2.cell, lm.lstmLayer3.cell]
-                update!(cell.Wi, -lr .* grads[cell.Wi])
-                update!(cell.Wh, -lr .* grads[cell.Wh])
-                update!(cell.b, -lr .* grads[cell.b])
-                update!(cell.h, -lr .* grads[cell.h])
-                update!(cell.c, -lr .* grads[cell.c])
-            end
-        end
+        # BACKWARD
+        p = params(lm)
+        grads = Tracker.gradient(() -> loss(X, Y), p)
+        update!(out, p, grads)
     end
 end
+
+
+######################################
+
+# corpus = read(open(joinpath(datadep"WikiText-103", "wiki.train.tokens"), "r"), String)
