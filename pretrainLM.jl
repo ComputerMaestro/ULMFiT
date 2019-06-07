@@ -114,9 +114,11 @@ end
 function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
     gradient_clip::Float64=0.25, initLearnRate::Number=30; epochs::Integer=1)
 
-    sentences = loadCorpus()
+    corpus = loadCorpus()
     gen = Channel(x -> generator(x, corpus; batchsize = batchsize, bptt = bptt))
     opt = Descent(initLearnRate)
+    T = Int(floot((K*2)/100))   # Averaging Trigger
+    accumulator = Dict(); k = 0
     for epoch=1:epochs
         X, Y = take!(gen)
         X, Y = broadcast(x -> onehot(x, lm.vocab), X), broadcast(y -> hcat(onehot(y, lm.vocab)...), Y)
@@ -131,11 +133,16 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
         # BACKWARD
         p = params(lm)
         grads = Tracker.gradient(() -> loss(X, Y), p)
-        update!(out, p, grads)
+        update!(opt, p, grads)
+
+        # ASGD Step
+        k += 1
+        avg_fact = 1/max(k - T, 1)
+        if avg_fact != 1
+            for ps in p
+                accumulator[ps] = accumulator[ps] .+ ps.data
+                ps.data = avg_fact*(accumulator[ps])
+            end
+        end
     end
 end
-
-
-######################################
-
-# corpus = read(open(joinpath(datadep"WikiText-103", "wiki.train.tokens"), "r"), String)
