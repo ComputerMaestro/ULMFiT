@@ -9,6 +9,7 @@ using BSON  ##For saving model weights
 using Flux  #For building models
 using Flux: Tracker, onecold, crossentropy, chunk, batch
 using Base.Iterators: partition
+using LinearAlgebra: norm
 
 # Initializing wegiths between [-1/sqrt(H), 1/sqrt(H)] where H = hidden size
 init_weights(dims...) = randn(Float32, dims...) .* sqrt(Float32(1/1150))
@@ -105,14 +106,13 @@ end
 
 # objective funciton
 function loss(X, Y)
-    H = softmax.(X)
     l = sum(crossentropy.(H, Y))
     Flux.truncate!(lm)
     return l
 end
 
 function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
-    gradient_clip::Float64=0.25, initLearnRate::Number=30; epochs::Integer=1)
+    gradient_clip::Float64=0.25, initLearnRate::Number=30; epochs::Integer=1, α::Number=2, β::Number=1)
 
     corpus = loadCorpus()
     gen = Channel(x -> generator(x, corpus; batchsize = batchsize, bptt = bptt))
@@ -129,10 +129,14 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
         X = lm.wordDropout.(X)
         X = lm.RecurrentLayers.(X) #outputMat is a vector of matrices of output sentences
         X = broadcast(x -> TiedEmbeddings(x, emDropMat), X)
+        Ht = softmax.(X)
+        Ht_prev = [h.data for h in Ht]
 
         # BACKWARD
         p = params(lm)
-        grads = Tracker.gradient(() -> loss(X, Y), p)
+        #Loss calculation with AR and TAR regulatization
+        l = loss(Ht, Y) + α*sum(norm, Ht) + β*sum(norm, Ht .- Ht_prev)
+        grads = Tracker.gradient(() -> l, p)
         update!(opt, p, grads)
 
         # ASGD Step
