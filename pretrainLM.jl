@@ -7,7 +7,7 @@ using InternedStrings   #For using Interned strings
 using DelimitedFiles   # For reading and writing files
 using BSON  ##For saving model weights
 using Flux  #For building models
-using Flux: Tracker, onecold, crossentropy, chunk, batch
+using Flux: Tracker, onecold, crossentropy, chunk
 using LinearAlgebra: norm
 
 init_weights(dims...) = randn(Float32, dims...) .* sqrt(Float32(1/1150))
@@ -97,10 +97,10 @@ function dropConnect(lm::LanguageModel)
     for layer in [lm.lstmLayer1, lm.lstmLayer2, lm.lstmLayer3]
         maskWi = dropMask(lm.hidDropProb, size(layer.cell.Wi); type = Float32)
         maskWh = dropMask(lm.hidDropProb, size(layer.cell.Wh); type = Float32)
-        push!(droppedWeights["Wi"], layer.cell.Wi.data)
-        push!(droppedWeights["Wh"], layer.cell.Wh.data)
-        layer.cell.Wi = layer.cell.Wi .* maskWi
-        layer.cell.Wh = layer.cell.Wh .* maskWh
+        push!(droppedWeights["Wi"], copy(layer.cell.Wi.data))
+        push!(droppedWeights["Wh"], copy(layer.cell.Wh.data))
+        layer.cell.Wi.data .= layer.cell.Wi.data .* maskWi
+        layer.cell.Wh.data .= layer.cell.Wh.data .* maskWh
     end
     return droppedWeights
 end
@@ -142,7 +142,7 @@ function forward(X, lm::LanguageModel)
 end
 
 # objective funciton
-function loss(X, Y)
+function loss(H, Y)
     l = sum(crossentropy.(H, Y))
     Flux.truncate!(lm)
     return l
@@ -170,7 +170,7 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
         #Loss calculation with AR and TAR regulatization
         l = loss(Ht, Y) + α*sum(norm, Ht) + β*sum(norm, Ht .- Ht_prev)
         grads = Tracker.gradient(() -> l, p)
-        update!(opt, p, grads)
+        Tracker.update!(opt, p, grads)
 
         # ASGD Step
         k += 1
