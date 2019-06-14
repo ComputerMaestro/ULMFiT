@@ -26,7 +26,7 @@ mutable struct LanguageModel
 
     function LanguageModel(;embedDropProb::Float64 = 0.05, wordDropProb::Float64 = 0.4, hidDropProb::Float64 = 0.5, LayerDropProb::Float64 = 0.3, FinalDropProb::Float64 = 0.4)
         lm = new(
-            readdlm("vocab.csv",',', header=false)[:, 1],
+            intern.(string.(readdlm("vocab.csv",',', header=false)[:, 1])),
             LSTM(400, 1150; init = init_weights),
             LSTM(1150, 1150; init = init_weights),
             LSTM(1150, 400; init = init_weights),
@@ -50,7 +50,7 @@ include("WikiText103_DataDeps.jl")
 
 function loadCorpus(corpuspath::String = joinpath(datadep"WikiText-103", "wiki.train.tokens"))
     corpus = read(open(corpuspath, "r"), String)
-    return tokenize(corpus)
+    return intern.(tokenize(corpus))
 end
 
 #Adding "<pad>" keyowrd at the end if the length of the sentence is < bptt
