@@ -10,8 +10,10 @@ using Flux: Tracker, onecold, crossentropy, chunk
 using LinearAlgebra: norm
 using BSON: @save, @load  ##For saving model weights
 
+# Initializing funciton for model LSTM weights
 init_weights(dims...) = randn(Float32, dims...) .* sqrt(Float32(1/1150))
 
+# Language Model
 mutable struct LanguageModel
     vocab :: Vector
     lstmLayer1 :: Flux.Recur
@@ -44,10 +46,11 @@ end
 
 Flux.@treelike LanguageModel
 
-#Loading corpus and preprocessing steps
+# Loading corpus and preprocessing steps
 cd(@__DIR__)
 include("WikiText103_DataDeps.jl")
 
+# Loading Corpus
 function loadCorpus(corpuspath::String = joinpath(datadep"WikiText-103", "wiki.train.tokens"))
     corpus = read(open(corpuspath, "r"), String)
     return intern.(tokenize(corpus))
@@ -193,13 +196,12 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
     end
 end
 
-# Saving model
+# To save model
 function save_model!(lm::LanguageModel, filepath::String="ULMFiT-LM.bson")
     weights = Tracker.data.(params(lm))
     @save filepath weights
 end
-
-# Loading model
+# To load model
 function load_model!(lm::LanguageModel, filepath::String="ULMFiT-LM.bson")
     @load filepath weights
     Flux.loadparams!(lm, weights)
