@@ -5,10 +5,10 @@ ULMFiT - LANGUAGE MODEL [Word-by-Word]
 using WordTokenizers   #For accesories
 using InternedStrings   #For using Interned strings
 using DelimitedFiles   # For reading and writing files
-using BSON  ##For saving model weights
 using Flux  #For building models
 using Flux: Tracker, onecold, crossentropy, chunk
 using LinearAlgebra: norm
+using BSON: @save, @load  ##For saving model weights
 
 init_weights(dims...) = randn(Float32, dims...) .* sqrt(Float32(1/1150))
 
@@ -62,6 +62,7 @@ end
 # Generator, whenever it is called it gives one mini-batch
 function generator(c::Channel, corpus; batchsize::Integer=70, bptt::Integer=70)
     X_total, n = padding(chunk(corpus, batchsize))
+    put!(c, n)
     for i=1:Int(floor(n/bptt))
         start = bptt*(i-1) + 1
         batch = [Flux.batch(X_total[k][j] for k=1:batchsize) for j=start:start+bptt]
@@ -149,37 +150,57 @@ function loss(H, Y)
 end
 
 function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
-    gradient_clip::Float64=0.25, initLearnRate::Number=30; epochs::Integer=1, α::Number=2, β::Number=1)
+    gradient_clip::Float64=0.25, initLearnRate::Number=30, epochs::Integer=1, α::Number=2, β::Number=1)
 
     corpus = loadCorpus()
     gen = Channel(x -> generator(x, corpus; batchsize = batchsize, bptt = bptt))
+    num_of_batches = take!(gen)
     opt = Descent(initLearnRate)
     T = Int(floot((K*2)/100))   # Averaging Trigger
     accumulator = Dict(); k = 0
     for epoch=1:epochs
+        for i=1:num_of_batches
 
-        # FORWARD
-        X, Y = take!(gen)
-        X, Y = broadcast(x -> onehot(x, lm.vocab), X), broadcast(y -> hcat(onehot(y, lm.vocab)...), Y)
-        Ht = softmax.(forward(X, lm))
-        Ht_prev = [h.data for h in Ht]
+            # FORWARD
+            X, Y = take!(gen)
+            X, Y = broadcast(x -> onehot(x, lm.vocab), X), broadcast(y -> hcat(onehot(y, lm.vocab)...), Y)
+            Ht = softmax.(forward(X, lm))
+            Ht_prev = [h.data for h in Ht]
 
-        # BACKWARD
-        p = params(lm)
+            # BACKWARD
+            p = params(lm)
 
-        #Loss calculation with AR and TAR regulatization
-        l = loss(Ht, Y) + α*sum(norm, Ht) + β*sum(norm, Ht .- Ht_prev)
-        grads = Tracker.gradient(() -> l, p)
-        Tracker.update!(opt, p, grads)
+            #Loss calculation with AR and TAR regulatization
+            l = loss(Ht, Y) + α*sum(norm, Ht) + β*sum(norm, Ht .- Ht_prev)
+            grads = Tracker.gradient(() -> l, p)
+            Tracker.update!(opt, p, grads)
 
-        # ASGD Step
-        k += 1
-        avg_fact = 1/max(k - T, 1)
-        if avg_fact != 1
-            for ps in p
-                accumulator[ps] = accumulator[ps] .+ ps.data
-                ps.data = avg_fact*(accumulator[ps])
+            # ASGD Step
+            k += 1
+            avg_fact = 1/max(k - T, 1)
+            if avg_fact != 1
+                for ps in p
+                    accumulator[ps] = accumulator[ps] .+ ps.data
+                    ps.data = avg_fact*(accumulator[ps])
+                end
+            end
+
+            # Saving checkpoints
+            if ((i/num_of_batches)*100)%5 == 0
+                save_model!(lm)
             end
         end
     end
+end
+
+# Saving model
+function save_model!(lm::LanguageModel, filepath::String="ULMFiT-LM.bson")
+    weights = Tracker.data.(params(lm))
+    @save filepath weights
+end
+
+# Loading model
+function load_model!(lm::LanguageModel, filepath::String="ULMFiT-LM.bson")
+    @load filepath weights
+    Flux.loadparams!(lm, weights)
 end
