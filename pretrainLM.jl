@@ -6,9 +6,10 @@ using WordTokenizers   #For accesories
 using InternedStrings   #For using Interned strings
 using DelimitedFiles   # For reading and writing files
 using Flux  #For building models
-using Flux: Tracker, onecold, crossentropy, chunk
+using Flux: Tracker, crossentropy, chunk
 using LinearAlgebra: norm
 using BSON: @save, @load  ##For saving model weights
+# using CuArrays  # For GPU support
 
 # Initializing funciton for model LSTM weights
 init_weights(dims...) = randn(Float32, dims...) .* sqrt(Float32(1/1150))
@@ -51,7 +52,7 @@ cd(@__DIR__)
 include("WikiText103_DataDeps.jl")
 
 # Loading Corpus
-function loadCorpus(corpuspath::String = joinpath(datadep"WikiText-103", "wiki.train.tokens"))
+function loadCorpus(corpuspath::String = joinpath(datadep"WikiText-103", "wiki.valid.tokens"))
     corpus = read(open(corpuspath, "r"), String)
     return intern.(tokenize(corpus))
 end
@@ -157,10 +158,14 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
 
     corpus = loadCorpus()
     gen = Channel(x -> generator(x, corpus; batchsize = batchsize, bptt = bptt))
-    num_of_batches = take!(gen)
-    opt = Descent(initLearnRate)
-    T = Int(floot((K*2)/100))   # Averaging Trigger
-    accumulator = Dict(); k = 0
+
+    opt = Descent(initLearnRate)    # Optimizer
+
+    num_of_batches = take!(gen) # Number of mini-batches
+    T = Int(floor((num_of_batches*2)/100))   # Averaging Trigger
+    p = params(lm)
+    accumulator = Tracker.data.(p); k = 0   # Accumulator for ASGD
+
     for epoch=1:epochs
         for i=1:num_of_batches
 
@@ -173,7 +178,7 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
             # BACKWARD
             p = params(lm)
 
-            #Loss calculation with AR and TAR regulatization
+            # Loss calculation with AR and TAR regulatization
             l = loss(Ht, Y) + α*sum(norm, Ht) + β*sum(norm, Ht .- Ht_prev)
             grads = Tracker.gradient(() -> l, p)
             Tracker.update!(opt, p, grads)
@@ -182,9 +187,9 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
             k += 1
             avg_fact = 1/max(k - T, 1)
             if avg_fact != 1
-                for ps in p
-                    accumulator[ps] = accumulator[ps] .+ ps.data
-                    ps.data = avg_fact*(accumulator[ps])
+                accumulator = accumulator + Tracker.data.(p)
+                for i=1:length(p.order)
+                    p.order[i].data .= avg_fact*copy(accumulator[i])
                 end
             end
 
