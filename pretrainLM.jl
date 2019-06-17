@@ -9,7 +9,7 @@ using Flux  #For building models
 using Flux: Tracker, crossentropy, chunk
 using LinearAlgebra: norm
 using BSON: @save, @load  ##For saving model weights
-# using CuArrays  # For GPU support
+using CuArrays  # For GPU support
 
 # Initializing funciton for model LSTM weights
 init_weights(dims...) = randn(Float32, dims...) .* sqrt(Float32(1/1150))
@@ -30,9 +30,9 @@ mutable struct LanguageModel
     function LanguageModel(;embedDropProb::Float64 = 0.05, wordDropProb::Float64 = 0.4, hidDropProb::Float64 = 0.5, LayerDropProb::Float64 = 0.3, FinalDropProb::Float64 = 0.4)
         lm = new(
             intern.(string.(readdlm("vocab.csv",',', header=false)[:, 1])),
-            LSTM(400, 1150; init = init_weights),
-            LSTM(1150, 1150; init = init_weights),
-            LSTM(1150, 400; init = init_weights),
+            gpu(LSTM(400, 1150; init = init_weights)),
+            gpu(LSTM(1150, 1150; init = init_weights)),
+            gpu(LSTM(1150, 400; init = init_weights)),
             embedDropProb,
             wordDropProb,
             hidDropProb,
@@ -40,7 +40,7 @@ mutable struct LanguageModel
             FinalDropProb
         )
         lm.vocab[1] = "<unk>"; lm.vocab[2] = "<pos>";push!(lm.vocab, "<eos>")  ## TO be implemented in datadep file
-        lm.embedMat = param(randn(Float32, size(lm.vocab)[1], 400) .* 0.1f0)
+        lm.embedMat = gpu(param(randn(Float32, size(lm.vocab)[1], 400) .* 0.1f0))
         return lm
     end
 end
@@ -52,7 +52,7 @@ cd(@__DIR__)
 include("WikiText103_DataDeps.jl")
 
 # Loading Corpus
-function loadCorpus(corpuspath::String = joinpath(datadep"WikiText-103", "wiki.valid.tokens"))
+function loadCorpus(corpuspath::String = joinpath(datadep"WikiText-103", "wiki.train.tokens"))
     corpus = read(open(corpuspath, "r"), String)
     return intern.(tokenize(corpus))
 end
@@ -79,7 +79,7 @@ onehot(wordVect::Vector, vocab::Vector) =
 
 function embeddingDropout(lm :: LanguageModel)
     dropoutMask = rand(size(lm.embedMat)[1], 1) .> lm.embedDropProb
-    return lm.embedMat .* dropoutMask
+    return lm.embedMat .* gpu(dropoutMask)
 end
 
 function embeddings(ohVect::Vector{Flux.OneHotVector}, emDropMat::TrackedArray, lm::LanguageModel)
@@ -93,8 +93,8 @@ TiedEmbeddings(in::TrackedArray, emDropMat::TrackedArray) = emDropMat*in
 # Mask generation
 dropMask(p, shape; type = Float64) = (rand(type, shape...) .> p) .* type(1/(1 - p))
 
-# Apply dropout
-dropout(x, mask) = x .* mask
+# Apply dropping
+drop(x, mask) = x .* gpu(mask)
 
 # DropConnect for lstm Layers
 function dropConnect(lm::LanguageModel)
@@ -104,8 +104,8 @@ function dropConnect(lm::LanguageModel)
         maskWh = dropMask(lm.hidDropProb, size(layer.cell.Wh); type = Float32)
         push!(droppedWeights["Wi"], copy(layer.cell.Wi.data))
         push!(droppedWeights["Wh"], copy(layer.cell.Wh.data))
-        layer.cell.Wi.data .= layer.cell.Wi.data .* maskWi
-        layer.cell.Wh.data .= layer.cell.Wh.data .* maskWh
+        layer.cell.Wi.data .= drop(layer.cell.Wi.data, maskWi)
+        layer.cell.Wh.data .= drop(layer.cell.Wh.data, maskWh)
     end
     return droppedWeights
 end
@@ -122,7 +122,6 @@ end
 
 # Forward pass
 function forward(X, lm::LanguageModel)
-    emDropMat = embeddingDropout(lm)
     masks = Dict()
     masks["wordDropMask"] = dropMask(lm.wordDropProb, (400, batchsize))
     masks["layerDropMask"] = dropMask(lm.LayerDropProb, (1150, batchsize))
@@ -130,15 +129,17 @@ function forward(X, lm::LanguageModel)
 
     droppedWeights = dropConnect(lm)
 
+    emDropMat = embeddingDropout(lm)
+    X = gpu.(broadcast(x -> embeddings(x, emDropMat, lm), X))
+
     X = Chain(
-        x -> embeddings(x, emDropMat, lm),
-        x -> dropout(x, masks["wordDropMask"]),
+        x -> drop(x, masks["wordDropMask"]),
         lm.lstmLayer1,
-        x -> dropout(x, masks["layerDropMask"]),
+        x -> drop(x, masks["layerDropMask"]),
         lm.lstmLayer2,
-        x -> dropout(x, masks["layerDropMask"]),
+        x -> drop(x, masks["layerDropMask"]),
         lm.lstmLayer3,
-        x -> dropout(x, masks["finalDropMask"]),
+        x -> drop(x, masks["finalDropMask"]),
         x -> TiedEmbeddings(x, emDropMat)
     ).(X)
 
