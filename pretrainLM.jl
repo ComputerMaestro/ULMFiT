@@ -77,16 +77,12 @@ end
 onehot(wordVect::Vector, vocab::Vector) =
     oh_repr = broadcast(x -> (x ∈ lm.vocab) ? Flux.onehot(x, vocab) : Flux.onehot("<unk>", vocab), wordVect)
 
-function embeddingDropout(lm :: LanguageModel)
+function embeddingDropout(lm::LanguageModel)
     dropoutMask = rand(size(lm.embedMat)[1], 1) .> lm.embedDropProb
     return lm.embedMat .* gpu(dropoutMask)
 end
 
-function embeddings(ohVect::Vector{Flux.OneHotVector}, emDropMat::TrackedArray, lm::LanguageModel)
-    embeddings = Array{Bool, 2}(UndefInitializer(), length(lm.vocab), 0)
-    embeddings = hcat(embeddings, hcat(ohVect...))
-    return transpose(emDropMat)*embeddings
-end
+embeddings(ohVect::Flux.OneHotMatrix, emDropMat::TrackedArray) = transpose(emDropMat)*ohVect
 
 TiedEmbeddings(in::TrackedArray, emDropMat::TrackedArray) = emDropMat*in
 
@@ -114,14 +110,15 @@ end
 function restoreWeights!(lm::LanguageModel, droppedWeights)
     lstms = [lm.lstmLayer1, lm.lstmLayer2, lm.lstmLayer3]
     for num=1:3
-        lstms[num].cell.Wi.data .= droppedWeights["Wi"][num]
-        lstms[num].cell.Wh.data .= droppedWeights["Wh"][num]
+        lstms[num].cell.Wi.data .= gpu(droppedWeights["Wi"][num])
+        lstms[num].cell.Wh.data .= gpu(droppedWeights["Wh"][num])
     end
-    return lm
+    return nothing
 end
 
 # Forward pass
 function forward(X, lm::LanguageModel)
+    emDropMat = embeddingDropout(lm)
     masks = Dict()
     masks["wordDropMask"] = dropMask(lm.wordDropProb, (400, batchsize))
     masks["layerDropMask"] = dropMask(lm.LayerDropProb, (1150, batchsize))
@@ -129,10 +126,8 @@ function forward(X, lm::LanguageModel)
 
     droppedWeights = dropConnect(lm)
 
-    emDropMat = embeddingDropout(lm)
-    X = gpu.(broadcast(x -> embeddings(x, emDropMat, lm), X))
-
     X = Chain(
+        x -> embeddings(x, emDropMat),
         x -> drop(x, masks["wordDropMask"]),
         lm.lstmLayer1,
         x -> drop(x, masks["layerDropMask"]),
@@ -165,34 +160,39 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
     num_of_batches = take!(gen) # Number of mini-batches
     T = Int(floor((num_of_batches*2)/100))   # Averaging Trigger
     p = params(lm)
-    accumulator = Tracker.data.(p); k = 0   # Accumulator for ASGD
+    Ht_prev = gpu.(repeat([zeros(Float32, length(lm.vocab), batchsize)], bptt))
 
     for epoch=1:epochs
         for i=1:num_of_batches
 
             # FORWARD
             X, Y = take!(gen)
-            X, Y = broadcast(x -> onehot(x, lm.vocab), X), broadcast(y -> hcat(onehot(y, lm.vocab)...), Y)
+            X, Y = gpu.(broadcast(x -> hcat(onehot(x, lm.vocab)...), X)), gpu.(broadcast(y -> hcat(onehot(y, lm.vocab)...), Y))
             Ht = softmax.(forward(X, lm))
-            Ht_prev = [h.data for h in Ht]
 
             # BACKWARD
-            p = params(lm)
-
             # Loss calculation with AR and TAR regulatization
-            l = loss(Ht, Y) + α*sum(norm, Ht) + β*sum(norm, Ht .- Ht_prev)
+            l = loss(Ht, Y) + α*sum(norm, cpu.(Ht)) + β*sum(norm, cpu.(Ht .- Ht_prev))
             grads = Tracker.gradient(() -> l, p)
             Tracker.update!(opt, p, grads)
+            Ht_prev = [h.data for h in Ht]
 
             # ASGD Step
-            k += 1
-            avg_fact = 1/max(k - T, 1)
-            if avg_fact != 1
-                accumulator = accumulator + Tracker.data.(p)
-                for i=1:length(p.order)
-                    p.order[i].data .= avg_fact*copy(accumulator[i])
+            if i >= T
+                avg_fact = 1/max(i - T + 1, 1)
+                if avg_fact != 1
+                    accumulator = accumulator + Tracker.data.(p)
+                    i = 1
+                    for ps in p
+                        ps.data .= avg_fact*copy(accumulator[i])
+                        i += 1
+                    end
+                else
+                    accumulator = deepcopy(Tracker.data.(p))   # Accumulator for ASGD
                 end
             end
+
+            println("loss: $l", " iteration number: $i")
 
             # Saving checkpoints
             if ((i/num_of_batches)*100)%5 == 0
@@ -200,6 +200,7 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
             end
         end
     end
+    println("\nEpoch: $epoch")
 end
 
 # To save model
