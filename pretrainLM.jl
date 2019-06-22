@@ -87,14 +87,14 @@ embeddings(ohVect::Flux.OneHotMatrix, emDropMat::TrackedArray) = transpose(emDro
 TiedEmbeddings(in::TrackedArray, emDropMat::TrackedArray) = emDropMat*in
 
 # Mask generation
-dropMask(p, shape; type = Float64) = (rand(type, shape...) .> p) .* type(1/(1 - p))
+dropMask(p, shape; type = Float64) = gpu((rand(type, shape...) .> p) .* type(1/(1 - p)))
 
 # Apply dropping
-drop(x, mask) = x .* gpu(mask)
+drop(x, mask) = x .* mask
 
 # DropConnect for lstm Layers
 function dropConnect(lm::LanguageModel)
-    droppedWeights = Dict{String, Vector{Array{Float32,2}}}([("Wi", []), ("Wh", [])])
+    droppedWeights = Dict{String, Vector}([("Wi", []), ("Wh", [])])
     for layer in [lm.lstmLayer1, lm.lstmLayer2, lm.lstmLayer3]
         maskWi = dropMask(lm.hidDropProb, size(layer.cell.Wi); type = Float32)
         maskWh = dropMask(lm.hidDropProb, size(layer.cell.Wh); type = Float32)
@@ -110,8 +110,8 @@ end
 function restoreWeights!(lm::LanguageModel, droppedWeights)
     lstms = [lm.lstmLayer1, lm.lstmLayer2, lm.lstmLayer3]
     for num=1:3
-        lstms[num].cell.Wi.data .= gpu(droppedWeights["Wi"][num])
-        lstms[num].cell.Wh.data .= gpu(droppedWeights["Wh"][num])
+        lstms[num].cell.Wi.data .= droppedWeights["Wi"][num]
+        lstms[num].cell.Wh.data .= droppedWeights["Wh"][num]
     end
     return nothing
 end
@@ -163,6 +163,7 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
     Ht_prev = gpu.(repeat([zeros(Float32, length(lm.vocab), batchsize)], bptt))
 
     for epoch=1:epochs
+        println("\nEpoch: $epoch")
         for i=1:num_of_batches
 
             # FORWARD
@@ -174,6 +175,9 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
             # Loss calculation with AR and TAR regulatization
             l = loss(Ht, Y) + α*sum(norm, cpu.(Ht)) + β*sum(norm, cpu.(Ht .- Ht_prev))
             grads = Tracker.gradient(() -> l, p)
+            for ps in p     # Applying Gradient clipping
+                grads[ps].data = min.(grads[ps].data, gradient_clip)
+            end
             Tracker.update!(opt, p, grads)
             Ht_prev = [h.data for h in Ht]
 
@@ -200,7 +204,6 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
             end
         end
     end
-    println("\nEpoch: $epoch")
 end
 
 # To save model
