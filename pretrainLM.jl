@@ -27,19 +27,19 @@ mutable struct LanguageModel
     FinalDropProb :: Float64
     embedMat :: TrackedArray
 
-    function LanguageModel(;embedDropProb::Float64 = 0.05, wordDropProb::Float64 = 0.4, hidDropProb::Float64 = 0.5, LayerDropProb::Float64 = 0.3, FinalDropProb::Float64 = 0.4)
+    function LanguageModel(inLSTMSize::Integer=400, hidLSTMSize::Integer=1150, outLSTMSize::Integer=inLSTMSize;
+        embedDropProb::Float64 = 0.05, wordDropProb::Float64 = 0.4, hidDropProb::Float64 = 0.5, LayerDropProb::Float64 = 0.3, FinalDropProb::Float64 = 0.4)
         lm = new(
             intern.(string.(readdlm("vocab.csv",',', header=false)[:, 1])),
-            gpu(LSTM(400, 1150; init = init_weights)),
-            gpu(LSTM(1150, 1150; init = init_weights)),
-            gpu(LSTM(1150, 400; init = init_weights)),
+            gpu(LSTM(inLSTMSize, hidLSTMSize; init = init_weights)),
+            gpu(LSTM(hidLSTMSize, hidLSTMSize; init = init_weights)),
+            gpu(LSTM(hidLSTMSize, outLSTMSize; init = init_weights)),
             embedDropProb,
             wordDropProb,
             hidDropProb,
             LayerDropProb,
             FinalDropProb
         )
-        lm.vocab[1] = "<unk>"; lm.vocab[2] = "<pos>";push!(lm.vocab, "<eos>")  ## TO be implemented in datadep file
         lm.embedMat = gpu(param(randn(Float32, size(lm.vocab)[1], 400) .* 0.1f0))
         return lm
     end
@@ -74,27 +74,28 @@ function generator(c::Channel, corpus; batchsize::Integer=70, bptt::Integer=70)
     end
 end
 
+# Converts vector of words to vector of one-hot vectors
 onehot(wordVect::Vector, vocab::Vector) =
-    oh_repr = broadcast(x -> (x ∈ lm.vocab) ? Flux.onehot(x, vocab) : Flux.onehot("<unk>", vocab), wordVect)
+    oh_repr = broadcast(x -> (x ∈ vocab) ? Flux.onehot(x, vocab) : Flux.onehot("<unk>", vocab), wordVect)
 
-function embeddingDropout(lm::LanguageModel)
-    dropoutMask = rand(size(lm.embedMat)[1], 1) .> lm.embedDropProb
-    return lm.embedMat .* gpu(dropoutMask)
-end
+# Gives dropped out embeddings matrix
+embeddingDropout(lm::LanguageModel) = lm.embedMat .* (gpu(rand(size(lm.embedMat)[1], 1)) .> lm.embedDropProb)
 
-embeddings(ohVect::Flux.OneHotMatrix, emDropMat::TrackedArray) = transpose(emDropMat)*ohVect
+# Converitng one-hot matrix to word embedddings using dropped embedding matrix
+encoder(ohVect::Flux.OneHotMatrix, emDropMat::TrackedArray) = transpose(emDropMat)*ohVect
 
-TiedEmbeddings(in::TrackedArray, emDropMat::TrackedArray) = emDropMat*in
+# Weight-tying of embedding layer with softmax layer
+tiedDecoder(in::TrackedArray, emDropMat::TrackedArray) = emDropMat*in
 
 # Mask generation
-dropMask(p, shape; type = Float64) = gpu((rand(type, shape...) .> p) .* type(1/(1 - p)))
+dropMask(p, shape; type = Float64) = gpu(rand(type, shape...) .> p) .* type(1/(1 - p))
 
 # Apply dropping
 drop(x, mask) = x .* mask
 
 # DropConnect for lstm Layers
 function dropConnect(lm::LanguageModel)
-    droppedWeights = Dict{String, Vector}([("Wi", []), ("Wh", [])])
+    droppedWeights = Dict{String, Vector{Array{Float32, 2}}}([("Wi", []), ("Wh", [])])
     for layer in [lm.lstmLayer1, lm.lstmLayer2, lm.lstmLayer3]
         maskWi = dropMask(lm.hidDropProb, size(layer.cell.Wi); type = Float32)
         maskWh = dropMask(lm.hidDropProb, size(layer.cell.Wh); type = Float32)
@@ -110,24 +111,24 @@ end
 function restoreWeights!(lm::LanguageModel, droppedWeights)
     lstms = [lm.lstmLayer1, lm.lstmLayer2, lm.lstmLayer3]
     for num=1:3
-        lstms[num].cell.Wi.data .= droppedWeights["Wi"][num]
-        lstms[num].cell.Wh.data .= droppedWeights["Wh"][num]
+        lstms[num].cell.Wi.data .= gpu(droppedWeights["Wi"][num])
+        lstms[num].cell.Wh.data .= gpu(droppedWeights["Wh"][num])
     end
     return nothing
 end
 
 # Forward pass
-function forward(X, lm::LanguageModel)
+function forward(X, lm::LanguageModel, batchsize)
     emDropMat = embeddingDropout(lm)
-    masks = Dict()
-    masks["wordDropMask"] = dropMask(lm.wordDropProb, (400, batchsize))
-    masks["layerDropMask"] = dropMask(lm.LayerDropProb, (1150, batchsize))
-    masks["finalDropMask"] = dropMask(lm.FinalDropProb, (400, batchsize))
-
+    masks = Dict([
+        ("wordDropMask", dropMask(lm.wordDropProb, (400, batchsize))),
+        ("layerDropMask", dropMask(lm.LayerDropProb, (1150, batchsize))),
+        ("finalDropMask", dropMask(lm.FinalDropProb, (400, batchsize))),
+    ])
     droppedWeights = dropConnect(lm)
 
-    X = Chain(
-        x -> embeddings(x, emDropMat),
+    Layers = Chain(
+        x -> encoder(x, emDropMat),
         x -> drop(x, masks["wordDropMask"]),
         lm.lstmLayer1,
         x -> drop(x, masks["layerDropMask"]),
@@ -135,11 +136,12 @@ function forward(X, lm::LanguageModel)
         x -> drop(x, masks["layerDropMask"]),
         lm.lstmLayer3,
         x -> drop(x, masks["finalDropMask"]),
-        x -> TiedEmbeddings(x, emDropMat)
-    ).(X)
+        x -> tiedDecoder(x, emDropMat)
+    )
+    X = broadcast(x -> cpu(Layers(gpu(x))), X)
 
     restoreWeights!(lm, droppedWeights)
-    return X
+    return softmax.(X)
 end
 
 # objective funciton
@@ -150,7 +152,7 @@ function loss(H, Y)
 end
 
 function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
-    gradient_clip::Float64=0.25, initLearnRate::Number=30, epochs::Integer=1, α::Number=2, β::Number=1)
+    gradient_clip::Float64=0.25, initLearnRate::Number=30, epochs::Integer=1, α::Number=2, β::Number=1, checkpointIter::Integer=)
 
     corpus = loadCorpus()
     gen = Channel(x -> generator(x, corpus; batchsize = batchsize, bptt = bptt))
@@ -168,8 +170,8 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
 
             # FORWARD
             X, Y = take!(gen)
-            X, Y = gpu.(broadcast(x -> hcat(onehot(x, lm.vocab)...), X)), gpu.(broadcast(y -> hcat(onehot(y, lm.vocab)...), Y))
-            Ht = softmax.(forward(X, lm))
+            X, Y = broadcast(x -> hcat(onehot(x, lm.vocab)...), X), broadcast(y -> hcat(onehot(y, lm.vocab)...), Y)
+            Ht = forward(X, lm, batchsize)
 
             # BACKWARD
             # Loss calculation with AR and TAR regulatization
@@ -199,9 +201,7 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
             println("loss: $l", " iteration number: $i")
 
             # Saving checkpoints
-            if ((i/num_of_batches)*100)%5 == 0
-                save_model!(lm)
-            end
+            if i == checkpointIter save_model!(lm) end
         end
     end
 end
@@ -212,7 +212,7 @@ function save_model!(lm::LanguageModel, filepath::String="ULMFiT-LM.bson")
     @save filepath weights
 end
 # To load model
-function load_model!(lm::LanguageModel, filepath::String="ULMFiT-LM.bson")
+function load_model!(lm::LanguageModel, filepath::String=joinpath(datadep"pretrained-ULMFiT", "weights.bson"))
     @load filepath weights
     Flux.loadparams!(lm, weights)
 end
