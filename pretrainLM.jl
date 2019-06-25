@@ -2,13 +2,13 @@
 ULMFiT - LANGUAGE MODEL [Word-by-Word]
 """
 
-using WordTokenizers   #For accesories
-using InternedStrings   #For using Interned strings
+using WordTokenizers   # For accesories
+using InternedStrings   # For using Interned strings
 using DelimitedFiles   # For reading and writing files
-using Flux  #For building models
+using Flux  # For building models
 using Flux: Tracker, crossentropy, chunk
 using LinearAlgebra: norm
-using BSON: @save, @load  ##For saving model weights
+using BSON: @save, @load  # For saving model weights
 using CuArrays  # For GPU support
 
 # Initializing funciton for model LSTM weights
@@ -76,71 +76,72 @@ end
 
 # Converts vector of words to vector of one-hot vectors
 onehot(wordVect::Vector, vocab::Vector) =
-    oh_repr = broadcast(x -> (x ∈ vocab) ? Flux.onehot(x, vocab) : Flux.onehot("<unk>", vocab), wordVect)
+    oh_repr = broadcast(x -> (x ∈ vocab) ? Flux.onehot(x, vocab) : Flux.onehot("_unk_", vocab), wordVect)
 
 # Gives dropped out embeddings matrix
 embeddingDropout(lm::LanguageModel) = lm.embedMat .* (gpu(rand(size(lm.embedMat)[1], 1)) .> lm.embedDropProb)
 
 # Converitng one-hot matrix to word embedddings using dropped embedding matrix
-encoder(ohVect::Flux.OneHotMatrix, emDropMat::TrackedArray) = transpose(emDropMat)*ohVect
+embeddingLayer(ohrepr::Union{Flux.OneHotMatrix, Flux.OneHotVector}, emDropMat::TrackedArray) = transpose(emDropMat)*ohrepr
 
 # Weight-tying of embedding layer with softmax layer
 tiedDecoder(in::TrackedArray, emDropMat::TrackedArray) = emDropMat*in
 
 # Mask generation
-dropMask(p, shape; type = Float64) = gpu(rand(type, shape...) .> p) .* type(1/(1 - p))
+dropMask(p, shape; type = Float32) = gpu(rand(type, shape...) .> p) .* type(1/(1 - p))
 
 # Apply dropping
-drop(x, mask) = x .* mask
-
-# DropConnect for lstm Layers
-function dropConnect(lm::LanguageModel)
-    droppedWeights = Dict{String, Vector{Array{Float32, 2}}}([("Wi", []), ("Wh", [])])
-    for layer in [lm.lstmLayer1, lm.lstmLayer2, lm.lstmLayer3]
-        maskWi = dropMask(lm.hidDropProb, size(layer.cell.Wi); type = Float32)
-        maskWh = dropMask(lm.hidDropProb, size(layer.cell.Wh); type = Float32)
-        push!(droppedWeights["Wi"], copy(layer.cell.Wi.data))
-        push!(droppedWeights["Wh"], copy(layer.cell.Wh.data))
-        layer.cell.Wi.data .= drop(layer.cell.Wi.data, maskWi)
-        layer.cell.Wh.data .= drop(layer.cell.Wh.data, maskWh)
-    end
-    return droppedWeights
+struct VarDrop
+    mask::AbstractArray
 end
 
-# To restore dropped weight during DropConnect
-function restoreWeights!(lm::LanguageModel, droppedWeights)
-    lstms = [lm.lstmLayer1, lm.lstmLayer2, lm.lstmLayer3]
-    for num=1:3
-        lstms[num].cell.Wi.data .= gpu(droppedWeights["Wi"][num])
-        lstms[num].cell.Wh.data .= gpu(droppedWeights["Wh"][num])
-    end
+VarDrop(p, shape; type = Float32) = VarDrop(dropMask(p, shape; type = Float32))
+
+(d::VarDrop)(in) = in .* d.mask
+
+# Drop Connect
+struct DropConnect
+    droppedWi::Array{Float32, 2}
+    droppedWh::Array{Float32, 2}
+    layer
+end
+
+function DropConnect(p, layer)
+    dc = DropConnect(copy(layer.cell.Wi.data), copy(layer.cell.Wh.data), layer)
+    maskWi = dropMask(lm.hidDropProb, size(layer.cell.Wi); type = Float32)
+    maskWh = dropMask(lm.hidDropProb, size(layer.cell.Wh); type = Float32)
+    layer.cell.Wi.data .= (layer.cell.Wi.data .* maskWi)
+    layer.cell.Wh.data .= (layer.cell.Wh.data .* maskWh)
+    return dc
+end
+
+(dc::DropConnect)(in) = dc.layer(in)
+
+function restoreWeights!(dc::DropConnect)
+    dc.layer.cell.Wi.data .= gpu(dc.droppedWi)
+    dc.layer.cell.Wh.data .= gpu(dc.droppedWh)
     return nothing
 end
 
 # Forward pass
 function forward(X, lm::LanguageModel, batchsize)
     emDropMat = embeddingDropout(lm)
-    masks = Dict([
-        ("wordDropMask", dropMask(lm.wordDropProb, (400, batchsize))),
-        ("layerDropMask", dropMask(lm.LayerDropProb, (1150, batchsize))),
-        ("finalDropMask", dropMask(lm.FinalDropProb, (400, batchsize))),
-    ])
     droppedWeights = dropConnect(lm)
 
     Layers = Chain(
-        x -> encoder(x, emDropMat),
-        x -> drop(x, masks["wordDropMask"]),
-        lm.lstmLayer1,
-        x -> drop(x, masks["layerDropMask"]),
-        lm.lstmLayer2,
-        x -> drop(x, masks["layerDropMask"]),
-        lm.lstmLayer3,
-        x -> drop(x, masks["finalDropMask"]),
+        x -> embeddingLayer(x, emDropMat),
+        VarDrop(lm.wordDropProb, (400, batchsize)),
+        DropConnect(lm.lstmLayer1),
+        VarDrop(lm.LayerDropProb, (1150, batchsize)),
+        DropConnect(lm.lstmLayer2),
+        VarDrop(lm.LayerDropProb, (1150, batchsize)),
+        DropConnect(lm.lstmLayer3),
+        VarDrop(lm.FinalDropProb, (400, batchsize)),
         x -> tiedDecoder(x, emDropMat)
     )
     X = broadcast(x -> cpu(Layers(gpu(x))), X)
 
-    restoreWeights!(lm, droppedWeights)
+    restoreWeights!.(Layers[[3, 5, 7]])
     return softmax.(X)
 end
 
@@ -215,4 +216,30 @@ end
 function load_model!(lm::LanguageModel, filepath::String=joinpath(datadep"pretrained-ULMFiT", "weights.bson"))
     @load filepath weights
     Flux.loadparams!(lm, weights)
+end
+
+# Sampling
+function sampling(lm::LanguageModel, startingText::String)
+    LSTMs = Chain(
+        lm.lstmLayer1,
+        lm.lstmLayer2,
+        lm.lstmLayer3,
+    )
+
+    tokens = tokenize(startingText)
+    ohrep = onehot(tokens, lm.vocab)
+    embeddings = map(x -> embeddingLayer(x, lm.embedMat), ohrep)
+    h = (LSTMs.(embeddings))[end]
+    probabilities = softmax(tiedDecoder(h, lm.embedMat))
+    prediction = lm.vocab[findall(isequal(maximum(probabilities)), probabilities)]
+    print(prediction[1], ' ')
+
+    while true
+        h = LSTMs(h)
+        probabilities = softmax(tiedDecoder(h, lm.embedMat))
+        prediction = lm.vocab[findall(isequal(maximum(probabilities)), probabilities)]
+        print(prediction[1], ' ')
+        prediction == "_pad_" && break
+    end
+    println(prediction)
 end
