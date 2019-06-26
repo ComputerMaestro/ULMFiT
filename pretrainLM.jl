@@ -90,7 +90,7 @@ tiedDecoder(in::TrackedArray, emDropMat::TrackedArray) = emDropMat*in
 # Mask generation
 dropMask(p, shape; type = Float32) = gpu(rand(type, shape...) .> p) .* type(1/(1 - p))
 
-# Apply dropping
+########################## Varitional DropOut ######################
 struct VarDrop
     mask::AbstractArray
 end
@@ -98,8 +98,9 @@ end
 VarDrop(p, shape; type = Float32) = VarDrop(dropMask(p, shape; type = Float32))
 
 (d::VarDrop)(in) = in .* d.mask
+####################################################################
 
-# Drop Connect
+########################### Drop Connect ###########################
 struct DropConnect
     droppedWi::Array{Float32, 2}
     droppedWh::Array{Float32, 2}
@@ -108,8 +109,8 @@ end
 
 function DropConnect(p, layer)
     dc = DropConnect(copy(layer.cell.Wi.data), copy(layer.cell.Wh.data), layer)
-    maskWi = dropMask(lm.hidDropProb, size(layer.cell.Wi); type = Float32)
-    maskWh = dropMask(lm.hidDropProb, size(layer.cell.Wh); type = Float32)
+    maskWi = dropMask(p, size(layer.cell.Wi); type = Float32)
+    maskWh = dropMask(p, size(layer.cell.Wh); type = Float32)
     layer.cell.Wi.data .= (layer.cell.Wi.data .* maskWi)
     layer.cell.Wh.data .= (layer.cell.Wh.data .* maskWh)
     return dc
@@ -122,27 +123,28 @@ function restoreWeights!(dc::DropConnect)
     dc.layer.cell.Wh.data .= gpu(dc.droppedWh)
     return nothing
 end
+####################################################################
 
 # Forward pass
 function forward(X, lm::LanguageModel, batchsize)
     emDropMat = embeddingDropout(lm)
-    droppedWeights = dropConnect(lm)
 
     Layers = Chain(
         x -> embeddingLayer(x, emDropMat),
         VarDrop(lm.wordDropProb, (400, batchsize)),
-        DropConnect(lm.lstmLayer1),
+        DropConnect(lm.hidDropProb, lm.lstmLayer1),
         VarDrop(lm.LayerDropProb, (1150, batchsize)),
-        DropConnect(lm.lstmLayer2),
+        DropConnect(lm.hidDropProb, lm.lstmLayer2),
         VarDrop(lm.LayerDropProb, (1150, batchsize)),
-        DropConnect(lm.lstmLayer3),
+        DropConnect(lm.hidDropProb, lm.lstmLayer3),
         VarDrop(lm.FinalDropProb, (400, batchsize)),
-        x -> tiedDecoder(x, emDropMat)
+        x -> tiedDecoder(x, emDropMat),
+        softmax
     )
     X = broadcast(x -> cpu(Layers(gpu(x))), X)
 
     restoreWeights!.(Layers[[3, 5, 7]])
-    return softmax.(X)
+    return X
 end
 
 # objective funciton
@@ -155,8 +157,7 @@ end
 function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
     gradient_clip::Float64=0.25, initLearnRate::Number=30, epochs::Integer=1, α::Number=2, β::Number=1, checkpointIter::Integer=)
 
-    corpus = loadCorpus()
-    gen = Channel(x -> generator(x, corpus; batchsize = batchsize, bptt = bptt))
+    gen = Channel(x -> generator(x, loadCorpus(); batchsize = batchsize, bptt = bptt))
 
     opt = Descent(initLearnRate)    # Optimizer
 
