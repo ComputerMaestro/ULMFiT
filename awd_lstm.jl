@@ -62,26 +62,27 @@ end
 
 # ASGD Weight-Dropped LSTM Layer
 mutable struct AWD_LSTM
-    T
     layer::Flux.Recur
+    T
     accum
 
-    AWD_LSTM(trigger_iter, a...; kw...) = new(
-                                            trigger_iter,
-                                            WeightDroppedLSTM(a...; kw...)
-                                        )
+    AWD_LSTM(a...; kw...) = new(WeightDroppedLSTM(a...; kw...))
 end
 
 (m::AWD_LSTM)(in) = m.layer(in)
 
+setTrigger!(trigger_point, m::AWD_LSTM) = m.T = trigger_point;
+
 params(m::AWD_LSTM) = Flux.params(m.layer)
+
 function gpu(m::AWD_LSTM)
     ps = params(m)
     for p in ps
         p = Flux.gpu(p)
     end
-    m.maskWi = Flux.gpu(m.mask)
-    m.maskWh = Flux.gpu()
+    m.layer.cell.maskWi = Flux.gpu(m.layer.cell.maskWi)
+    m.layer.cell.maskWh = Flux.gpu(m.layer.cell.maskWh)
+    return nothing
 end
 
 # Averaged Stochastic Gradient Descent Step
