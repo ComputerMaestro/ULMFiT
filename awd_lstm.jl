@@ -5,7 +5,10 @@ Weight-Dropped LSTM
 using Flux
 import Flux: gate, tanh, σ, Tracker, params, gpu
 
-# Weight-Dropped LSTM Cell
+# Generates Mask
+dropMask(p, shape; type = Float32) = rand(type, shape...) .> p .* type(1/(1 - p))
+
+#################### Weight-Dropped LSTM Cell#######################
 mutable struct WeightDroppedLSTMCell{A, V}
     Wi::A
     Wh::A
@@ -26,8 +29,8 @@ function WeightDroppedLSTMCell(in::Integer, out::Integer, probability::Float64=0
         param(zeros(Float32, out)),
         param(zeros(Float32, out)),
         probability,
-        rand(Float32, out*4, in) .> probability,
-        rand(Float32, out*4, in) .> probability,
+        dropMask(probability, (out*4, in)),
+        dropMask(probability, (out*4, out))
     )
     cell.b.data[gate(out, 2)] .= 1
     return cell
@@ -55,12 +58,13 @@ function WeightDroppedLSTM(a...; kw...)
 end
 
 function resetMasks!(wd::T) where T <: Flux.Recur{<:WeightDroppedLSTMCell}
-    wd.cell.maskWi = gpu(rand(Float32, size(wd.cell.Wi)...)) .> wd.cell.p
-    wd.cell.maskWh = gpu(rand(Float32, size(wd.cell.Wh)...)) .> wd.cell.p
+    wd.cell.maskWi = dropMask(wd.cell.p, size(wd.cell.Wi))
+    wd.cell.maskWh = dropMask(wd.cell.p, size(wd.cell.Wi))
     return nothing
 end
+####################################################################
 
-# ASGD Weight-Dropped LSTM Layer
+################## ASGD Weight-Dropped LSTM Layer###################
 mutable struct AWD_LSTM
     layer::Flux.Recur
     T
@@ -82,11 +86,11 @@ function gpu(m::AWD_LSTM)
     end
     m.layer.cell.maskWi = Flux.gpu(m.layer.cell.maskWi)
     m.layer.cell.maskWh = Flux.gpu(m.layer.cell.maskWh)
-    return nothing
+    return m
 end
 
 # Averaged Stochastic Gradient Descent Step
-function asgd_step(iter, layer::AWD_LSTM)
+function asgd_step!(iter, layer::AWD_LSTM)
     p = params(layer)
     if iter >= layer.T
         avg_fact = 1/max(iter - layer.T + 1, 1)
@@ -102,3 +106,38 @@ function asgd_step(iter, layer::AWD_LSTM)
         end
     end
 end
+####################################################################
+
+########################## Varitional DropOut ######################
+struct VarDrop{A, F} where A <: AbstractArray F <: AbstractFloat
+    mask::A
+    p::F
+end
+
+VarDrop(probaility=0.0, shape) = VarDrop(gpu(dropMask(probability, shape)), probability)
+
+(vd::VarDrop)(in) = in .* vd.mask
+
+resetMasks!(vd::VarDrop) = (vd.mask = gpu(dropMask(vd.p, size(vd.mask))));
+####################################################################
+
+################# Varitioanl Dropped Embeddings ####################
+struct DroppedEmbeddings{T, A} where T <: TrackedArray A <: AbstractArray
+    emb::T
+    p
+    mask::A
+    tying::Bool
+    interm_lyrs
+
+    DroppedEmbeddings(in, embed_size, probability::Float64, weight_tying::Bool= false, intermediate_lyrs = nothing; init = Flux.glorot_uniform) =
+        !weight_tying && return new(param(init(in, embed_size)), probability, dropMask(probability, (in, 1)), weight_tying);
+        return new(param(init(in, embed_size)), probability, dropMask(probability, (in, 1)), weight_tying, intermediate_lyrs)
+end
+
+function (de::DroppedEmbeddings)(in)
+    embeddings = transpose((de.emb .* de.mask))*in
+    return de.tying ? de.emb*de.interm_lyrs(embeddings) : embeddings
+end
+
+resetMasks!(de::DroppedEmbeddings) = (de.mask = dropMask(de.p, (size(de.emb, 1), 1)));
+####################################################################
