@@ -11,44 +11,12 @@ using LinearAlgebra: norm
 using BSON: @save, @load  # For saving model weights
 using CuArrays  # For GPU support
 
-# Initializing funciton for model LSTM weights
-init_weights(dims...) = randn(Float32, dims...) .* sqrt(Float32(1/1150))
-
-# Language Model
-mutable struct LanguageModel
-    vocab :: Vector
-    lstmLayer1 :: Flux.Recur
-    lstmLayer2 :: Flux.Recur
-    lstmLayer3 :: Flux.Recur
-    embedDropProb :: Float64
-    wordDropProb :: Float64
-    hidDropProb :: Float64
-    LayerDropProb :: Float64
-    FinalDropProb :: Float64
-    embedMat :: TrackedArray
-
-    function LanguageModel(inLSTMSize::Integer=400, hidLSTMSize::Integer=1150, outLSTMSize::Integer=inLSTMSize;
-        embedDropProb::Float64 = 0.05, wordDropProb::Float64 = 0.4, hidDropProb::Float64 = 0.5, LayerDropProb::Float64 = 0.3, FinalDropProb::Float64 = 0.4)
-        lm = new(
-            intern.(string.(readdlm("vocab.csv",',', header=false)[:, 1])),
-            gpu(LSTM(inLSTMSize, hidLSTMSize; init = init_weights)),
-            gpu(LSTM(hidLSTMSize, hidLSTMSize; init = init_weights)),
-            gpu(LSTM(hidLSTMSize, outLSTMSize; init = init_weights)),
-            embedDropProb,
-            wordDropProb,
-            hidDropProb,
-            LayerDropProb,
-            FinalDropProb
-        )
-        lm.embedMat = gpu(param(randn(Float32, size(lm.vocab)[1], 400) .* 0.1f0))
-        return lm
-    end
-end
-
-Flux.@treelike LanguageModel
-
-# Loading corpus and preprocessing steps
 cd(@__DIR__)
+
+# import AWD_LSTM layer
+include("awd_lstm.jl")
+
+# including WikiText-103 Corpus
 include("WikiText103_DataDeps.jl")
 
 # Loading Corpus
@@ -57,11 +25,36 @@ function loadCorpus(corpuspath::String = joinpath(datadep"WikiText-103", "wiki.t
     return intern.(tokenize(corpus))
 end
 
-#Adding "<pad>" keyowrd at the end if the length of the sentence is < bptt
-function padding(batches::Vector)
-    n = maximum([length(x) for x in batches])
-    return ([length(batch) < n ? cat(batch, repeat(["<pos>"], n-length(batch)); dims = 1) : batch[1:n] for batch in batches], n)
+# Language Model
+mutable struct LanguageModel
+    vocab :: Vector
+    lstm_layer1 :: AWD_LSTM
+    lstm_layer2 :: AWD_LSTM
+    lstm_layer3 :: AWD_LSTM
+    embedDropProb :: Float64
+    wordDropProb :: Float64
+    LayerDropProb :: Float64
+    FinalDropProb :: Float64
+    embedding_layer :: DroppedEmbeddings
+
+    function LanguageModel(inLSTMSize::Integer=400, hidLSTMSize::Integer=1150, outLSTMSize::Integer=inLSTMSize;
+        embedDropProb::Float64 = 0.05, wordDropProb::Float64 = 0.4, hidDropProb::Float64 = 0.5, LayerDropProb::Float64 = 0.3, FinalDropProb::Float64 = 0.4)
+        lm = new(
+            intern.(string.(readdlm("vocab.csv",',', header=false)[:, 1])),
+            gpu(AWD_LSTM(inLSTMSize, hidLSTMSize, hidDropProb; init = (dims..) -> init_weights(1/hidLSTMSize, dims...))),
+            gpu(AWD_LSTM(hidLSTMSize, hidLSTMSize, hidDropProb; init = (dims..) -> init_weights(1/hidLSTMSize, dims...))),
+            gpu(AWD_LSTM(hidLSTMSize, outLSTMSize, hidDropProb; init = (dims..) -> init_weights(1/hidLSTMSize, dims...))),
+            embedDropProb,
+            wordDropProb,
+            LayerDropProb,
+            FinalDropProb
+        )
+        lm.embedding_layer = gpu(DroppedEmbeddings(length(lm.vocab), 400, 0.1, true); init = (dims..) -> init_weights(0.1, dims...))
+        return lm
+    end;
 end
+
+Flux.@treelike LanguageModel
 
 # Generator, whenever it is called it gives one mini-batch
 function generator(c::Channel, corpus; batchsize::Integer=70, bptt::Integer=70)
@@ -70,135 +63,80 @@ function generator(c::Channel, corpus; batchsize::Integer=70, bptt::Integer=70)
     for i=1:Int(floor(n/bptt))
         start = bptt*(i-1) + 1
         batch = [Flux.batch(X_total[k][j] for k=1:batchsize) for j=start:start+bptt]
-        put!(c, (batch[1:end-1], batch[2:end]))
+        put!(c, batch[1:end-1])
+        put!(c, batch[2:end])
     end
 end
 
-# Converts vector of words to vector of one-hot vectors
-onehot(wordVect::Vector, vocab::Vector) =
-    oh_repr = broadcast(x -> (x ∈ vocab) ? Flux.onehot(x, vocab) : Flux.onehot("_unk_", vocab), wordVect)
+# Forward pass
+function forward(model_layers, batch::AbstractVector, lm::LanguageModel, batchsize::Integer, H_prev::AbstractArray, α, β)
+    batch = broadcast(x -> hcat(onehot(x, lm.vocab)...), batch)
+    resetMasks!.(model_layers[1:end-2])
+    batch = broadcast(x -> model_layers(gpu(x)), batch)
 
-# Gives dropped out embeddings matrix
-embeddingDropout(lm::LanguageModel) = lm.embedMat .* (gpu(rand(size(lm.embedMat)[1], 1)) .> lm.embedDropProb)
+    Y = take!(gen)
+    Y = broadcast(y -> gpu(hcat(onehot(y, lm.vocab)...)), Y)
+    l = loss(batch, Y, gpu.(H_prev), α, β)
 
-# Converitng one-hot matrix to word embedddings using dropped embedding matrix
-embeddingLayer(ohrepr::Union{Flux.OneHotMatrix, Flux.OneHotVector}, emDropMat::TrackedArray) = transpose(emDropMat)*ohrepr
-
-# Weight-tying of embedding layer with softmax layer
-tiedDecoder(in::TrackedArray, emDropMat::TrackedArray) = emDropMat*in
-
-# Mask generation
-dropMask(p, shape; type = Float32) = gpu(rand(type, shape...) .> p) .* type(1/(1 - p))
-
-########################## Varitional DropOut ######################
-struct VarDrop
-    mask::AbstractArray
+    return l, Tracker.data.(batch)
 end
 
-VarDrop(p, shape; type = Float32) = VarDrop(dropMask(p, shape; type = Float32))
-
-(d::VarDrop)(in) = in .* d.mask
-####################################################################
-
-########################### Drop Connect ###########################
-struct DropConnect
-    droppedWi::Array{Float32, 2}
-    droppedWh::Array{Float32, 2}
-    layer
+# loss funciton - Loss calculation with AR and TAR regulatization
+function loss(H, Y, H_prev, α, β)
+    expr(ht, yt, ht_prev) = sum(crossentropy(ht, yt)) + α*sum(norm, ht) + β*sum(norm, ht .- ht_prev)
+    l = sum(broadcast((ht, yt, ht_prev) -> expr(ht, yt, ht_prev), batch, Y, H_prev))
+    Flux.truncate!(lm)
+    return l, Tracker.data.(H)
 end
 
-function DropConnect(p, layer)
-    dc = DropConnect(copy(layer.cell.Wi.data), copy(layer.cell.Wh.data), layer)
-    maskWi = dropMask(p, size(layer.cell.Wi); type = Float32)
-    maskWh = dropMask(p, size(layer.cell.Wh); type = Float32)
-    layer.cell.Wi.data .= (layer.cell.Wi.data .* maskWi)
-    layer.cell.Wh.data .= (layer.cell.Wh.data .* maskWh)
-    return dc
-end
-
-(dc::DropConnect)(in) = dc.layer(in)
-
-function restoreWeights!(dc::DropConnect)
-    dc.layer.cell.Wi.data .= gpu(dc.droppedWi)
-    dc.layer.cell.Wh.data .= gpu(dc.droppedWh)
+# Backward
+function back!(p::Flux.Params, l, opt, gradient_clip::Float64)
+    grads = Tracker.gradient(() -> l, p)
+    for ps in p     # Applying Gradient clipping
+        grads[ps].data = min.(grads[ps].data, gradient_clip)
+    end
+    Tracker.update!(opt, p, grads)
     return nothing
 end
-####################################################################
 
-# Forward pass
-function forward(X, lm::LanguageModel, batchsize)
-    emDropMat = embeddingDropout(lm)
+# Funciton for training Language Model
+function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,gradient_clip::Float64=0.25,
+        initLearnRate::Number=30, epochs::Integer=1, α::Number=2, β::Number=1, checkpointIter::Integer=)
 
-    Layers = Chain(
-        x -> embeddingLayer(x, emDropMat),
-        VarDrop(lm.wordDropProb, (400, batchsize)),
-        DropConnect(lm.hidDropProb, lm.lstmLayer1),
-        VarDrop(lm.LayerDropProb, (1150, batchsize)),
-        DropConnect(lm.hidDropProb, lm.lstmLayer2),
-        VarDrop(lm.LayerDropProb, (1150, batchsize)),
-        DropConnect(lm.hidDropProb, lm.lstmLayer3),
-        VarDrop(lm.FinalDropProb, (400, batchsize)),
-        x -> tiedDecoder(x, emDropMat),
-        softmax
-    )
-    X = broadcast(x -> cpu(Layers(gpu(x))), X)
-
-    restoreWeights!.(Layers[[3, 5, 7]])
-    return X
-end
-
-# objective funciton
-function loss(H, Y)
-    l = sum(crossentropy.(H, Y))
-    Flux.truncate!(lm)
-    return l
-end
-
-function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,
-    gradient_clip::Float64=0.25, initLearnRate::Number=30, epochs::Integer=1, α::Number=2, β::Number=1, checkpointIter::Integer=)
-
+    # Initializations
     gen = Channel(x -> generator(x, loadCorpus(); batchsize = batchsize, bptt = bptt))
-
     opt = Descent(initLearnRate)    # Optimizer
-
     num_of_batches = take!(gen) # Number of mini-batches
     T = Int(floor((num_of_batches*2)/100))   # Averaging Trigger
     p = params(lm)
-    Ht_prev = gpu.(repeat([zeros(Float32, length(lm.vocab), batchsize)], bptt))
+    H_prev = repeat([zeros(Float32, length(lm.vocab), batchsize)], bptt)
 
+    model_layers = Chain(
+        lm.embedding_layer,
+        VarDrop(lm.wordDropProb, (400, batchsize)),
+        lm.lstm_layer1,
+        VarDrop(lm.LayerDropProb, (1150, batchsize)),
+        lm.lstm_layer2,
+        VarDrop(lm.LayerDropProb, (1150, batchsize)),
+        lm.lstm_layer3,
+        VarDrop(lm.FinalDropProb, (400, batchsize)),
+        x -> tiedEmbeddings(x, lm.embedding_layer),
+        softmax
+    )
+
+    # Pre-Training loops
     for epoch=1:epochs
         println("\nEpoch: $epoch")
         for i=1:num_of_batches
 
             # FORWARD
-            X, Y = take!(gen)
-            X, Y = broadcast(x -> hcat(onehot(x, lm.vocab)...), X), broadcast(y -> hcat(onehot(y, lm.vocab)...), Y)
-            Ht = forward(X, lm, batchsize)
+            l, H_prev = forward(model_layers, take!(gen), lm, batchsize, H_prev, α, β)
 
             # BACKWARD
-            # Loss calculation with AR and TAR regulatization
-            l = loss(Ht, Y) + α*sum(norm, cpu.(Ht)) + β*sum(norm, cpu.(Ht .- Ht_prev))
-            grads = Tracker.gradient(() -> l, p)
-            for ps in p     # Applying Gradient clipping
-                grads[ps].data = min.(grads[ps].data, gradient_clip)
-            end
-            Tracker.update!(opt, p, grads)
-            Ht_prev = [h.data for h in Ht]
+            back!(p, l, opt, gradient_clip)
 
-            # ASGD Step
-            if i >= T
-                avg_fact = 1/max(i - T + 1, 1)
-                if avg_fact != 1
-                    accumulator = accumulator + Tracker.data.(p)
-                    i = 1
-                    for ps in p
-                        ps.data .= avg_fact*copy(accumulator[i])
-                        i += 1
-                    end
-                else
-                    accumulator = deepcopy(Tracker.data.(p))   # Accumulator for ASGD
-                end
-            end
+            #ASGD Step
+            asgd_step!.(i, [lm.lstm_layer1,lm.lstm_layer2,lm.lstm_layer3])
 
             println("loss: $l", " iteration number: $i")
 
@@ -222,9 +160,9 @@ end
 # Sampling
 function sampling(lm::LanguageModel, startingText::String)
     LSTMs = Chain(
-        lm.lstmLayer1,
-        lm.lstmLayer2,
-        lm.lstmLayer3,
+        lm.lstm_layer1,
+        lm.lstm_layer2,
+        lm.lstm_layer3,
     )
 
     tokens = tokenize(startingText)

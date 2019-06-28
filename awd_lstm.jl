@@ -8,6 +8,19 @@ import Flux: gate, tanh, σ, Tracker, params, gpu
 # Generates Mask
 dropMask(p, shape; type = Float32) = rand(type, shape...) .> p .* type(1/(1 - p))
 
+# Converts vector of words to vector of one-hot vectors
+onehot(wordVect::Vector, vocab::Vector) =
+    oh_repr = broadcast(x -> (x ∈ vocab) ? Flux.onehot(x, vocab) : Flux.onehot("_unk_", vocab), wordVect)
+
+#Adding "<pad>" keyowrd at the end if the length of the sentence is < bptt
+function padding(batches::Vector)
+    n = maximum([length(x) for x in batches])
+    return ([length(batch) < n ? cat(batch, repeat(["<pos>"], n-length(batch)); dims = 1) : batch[1:n] for batch in batches], n)
+end
+
+# To initialize funciton for model LSTM weights
+init_weights(extreme::AbstractFloat, dims...) = randn(Float32, dims...) .* sqrt(Float32(extreme))
+
 #################### Weight-Dropped LSTM Cell#######################
 mutable struct WeightDroppedLSTMCell{A, V}
     Wi::A
@@ -109,7 +122,7 @@ end
 ####################################################################
 
 ########################## Varitional DropOut ######################
-struct VarDrop{A, F} where A <: AbstractArray F <: AbstractFloat
+struct VarDrop{A <: AbstractArray, F <: AbstractFloat}
     mask::A
     p::F
 end
@@ -121,23 +134,22 @@ VarDrop(probaility=0.0, shape) = VarDrop(gpu(dropMask(probability, shape)), prob
 resetMasks!(vd::VarDrop) = (vd.mask = gpu(dropMask(vd.p, size(vd.mask))));
 ####################################################################
 
-################# Varitioanl Dropped Embeddings ####################
-struct DroppedEmbeddings{T, A} where T <: TrackedArray A <: AbstractArray
+################# Varitional Dropped Embeddings ####################
+mutable struct DroppedEmbeddings{A <: AbstractArray, T <: TrackedArray}
     emb::T
-    p
+    p::Float64
     mask::A
-    tying::Bool
-    interm_lyrs
 
-    DroppedEmbeddings(in, embed_size, probability::Float64, weight_tying::Bool= false, intermediate_lyrs = nothing; init = Flux.glorot_uniform) =
-        !weight_tying && return new(param(init(in, embed_size)), probability, dropMask(probability, (in, 1)), weight_tying);
-        return new(param(init(in, embed_size)), probability, dropMask(probability, (in, 1)), weight_tying, intermediate_lyrs)
+    DroppedEmbeddings(in::Integer, embed_size::Integer, probability::Float64; init = Flux.glorot_uniform) =
+        new(param(init(in, embed_size)), probability, dropMask(probability, (in, 1)))
 end
 
-function (de::DroppedEmbeddings)(in)
-    embeddings = transpose((de.emb .* de.mask))*in
-    return de.tying ? de.emb*de.interm_lyrs(embeddings) : embeddings
-end
+(de::DroppedEmbeddings)(in::AbstractArray) = transpose((de.emb .* de.mask))*in
+
+gpu(de::DroppedEmbeddings) = (de.emb = gpu(de.emb));
 
 resetMasks!(de::DroppedEmbeddings) = (de.mask = dropMask(de.p, (size(de.emb, 1), 1)));
+
+# Weight-tying
+tiedEmbeddings(in::AbstractArray, de::DroppedEmbeddings) = (de.emb .* de.mask)*in
 ####################################################################
