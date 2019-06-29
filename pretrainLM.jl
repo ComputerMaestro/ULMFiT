@@ -6,10 +6,10 @@ using WordTokenizers   # For accesories
 using InternedStrings   # For using Interned strings
 using DelimitedFiles   # For reading and writing files
 using Flux  # For building models
-using Flux: Tracker, crossentropy, chunk
+using Flux: Tracker, crossentropy, chunk, gpu
 using LinearAlgebra: norm
 using BSON: @save, @load  # For saving model weights
-using CuArrays  # For GPU support
+# using CuArrays  # For GPU support
 
 cd(@__DIR__)
 
@@ -41,17 +41,17 @@ mutable struct LanguageModel
         embedDropProb::Float64 = 0.05, wordDropProb::Float64 = 0.4, hidDropProb::Float64 = 0.5, LayerDropProb::Float64 = 0.3, FinalDropProb::Float64 = 0.4)
         lm = new(
             intern.(string.(readdlm("vocab.csv",',', header=false)[:, 1])),
-            gpu(AWD_LSTM(inLSTMSize, hidLSTMSize, hidDropProb; init = (dims..) -> init_weights(1/hidLSTMSize, dims...))),
-            gpu(AWD_LSTM(hidLSTMSize, hidLSTMSize, hidDropProb; init = (dims..) -> init_weights(1/hidLSTMSize, dims...))),
-            gpu(AWD_LSTM(hidLSTMSize, outLSTMSize, hidDropProb; init = (dims..) -> init_weights(1/hidLSTMSize, dims...))),
+            AWD_LSTM(inLSTMSize, hidLSTMSize, hidDropProb; init = (dims...) -> init_weights(1/hidLSTMSize, dims...)),
+            AWD_LSTM(hidLSTMSize, hidLSTMSize, hidDropProb; init = (dims...) -> init_weights(1/hidLSTMSize, dims...)),
+            AWD_LSTM(hidLSTMSize, outLSTMSize, hidDropProb; init = (dims...) -> init_weights(1/hidLSTMSize, dims...)),
             embedDropProb,
             wordDropProb,
             LayerDropProb,
             FinalDropProb
         )
-        lm.embedding_layer = gpu(DroppedEmbeddings(length(lm.vocab), 400, 0.1, true); init = (dims..) -> init_weights(0.1, dims...))
+        lm.embedding_layer = DroppedEmbeddings(length(lm.vocab), 400, 0.1; init = (dims...) -> init_weights(0.1, dims...))
         return lm
-    end;
+    end
 end
 
 Flux.@treelike LanguageModel
@@ -71,7 +71,7 @@ end
 # Forward pass
 function forward(model_layers, batch::AbstractVector, lm::LanguageModel, batchsize::Integer, H_prev::AbstractArray, α, β)
     batch = broadcast(x -> hcat(onehot(x, lm.vocab)...), batch)
-    resetMasks!.(model_layers[1:end-2])
+    reset_masks!.(model_layers[1:end-2])
     batch = broadcast(x -> model_layers(gpu(x)), batch)
 
     Y = take!(gen)
@@ -101,7 +101,7 @@ end
 
 # Funciton for training Language Model
 function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,gradient_clip::Float64=0.25,
-        initLearnRate::Number=30, epochs::Integer=1, α::Number=2, β::Number=1, checkpointIter::Integer=)
+        initLearnRate::Number=30, epochs::Integer=1, α::Number=2, β::Number=1, checkpointIter::Integer=5000)
 
     # Initializations
     gen = Channel(x -> generator(x, loadCorpus(); batchsize = batchsize, bptt = bptt))
@@ -113,13 +113,13 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,gradien
 
     model_layers = Chain(
         lm.embedding_layer,
-        VarDrop(lm.wordDropProb, (400, batchsize)),
+        VarDrop((size(lm.embedding_layer.emb, 2), batchsize), lm.wordDropProb),
         lm.lstm_layer1,
-        VarDrop(lm.LayerDropProb, (1150, batchsize)),
+        VarDrop((size(lm.lstm_layer1.layer.cell.h, 1), batchsize), lm.LayerDropProb),
         lm.lstm_layer2,
-        VarDrop(lm.LayerDropProb, (1150, batchsize)),
+        VarDrop((size(lm.lstm_layer2.layer.cell.h, 1), batchsize), lm.LayerDropProb),
         lm.lstm_layer3,
-        VarDrop(lm.FinalDropProb, (400, batchsize)),
+        VarDrop((size(lm.lstm_layer3.layer.cell.h, 1), batchsize), lm.FinalDropProb),
         x -> tiedEmbeddings(x, lm.embedding_layer),
         softmax
     )
@@ -157,28 +157,52 @@ function load_model!(lm::LanguageModel, filepath::String=joinpath(datadep"pretra
     Flux.loadparams!(lm, weights)
 end
 
+function load_model!()
+    lm = LanguageModel()
+    load_model!(lm)
+    return lm
+end
+
+function load_model!(filepath::String)
+    lm = LanguageModel()
+    load_model!(lm, filepath)
+    return lm
+end
+
 # Sampling
-function sampling(lm::LanguageModel, startingText::String)
-    LSTMs = Chain(
+function sampling(starting_text::String, lm::LanguageModel=load_model!())
+    model_layers = Chain(
         lm.lstm_layer1,
         lm.lstm_layer2,
-        lm.lstm_layer3,
+        lm.lstm_layer3
     )
 
-    tokens = tokenize(startingText)
+    reset_probability!.(0.0, model_layers)
+    reset_masks!.(model_layers)
+
+    tokens = tokenize(starting_text)
     ohrep = onehot(tokens, lm.vocab)
-    embeddings = map(x -> embeddingLayer(x, lm.embedMat), ohrep)
-    h = (LSTMs.(embeddings))[end]
-    probabilities = softmax(tiedDecoder(h, lm.embedMat))
-    prediction = lm.vocab[findall(isequal(maximum(probabilities)), probabilities)]
-    print(prediction[1], ' ')
+    embeddings = lm.embedding_layer.(ohrep)
+    h = (model_layers.(embeddings))[end]
+    probabilities = softmax(tiedEmbeddings(h, lm.embedding_layer))
+    prediction = lm.vocab[findall(isequal(maximum(probabilities)), probabilities)[1]]
+    println("SAMPLING...")
+    print(prediction, ' ')
 
     while true
-        h = LSTMs(h)
-        probabilities = softmax(tiedDecoder(h, lm.embedMat))
-        prediction = lm.vocab[findall(isequal(maximum(probabilities)), probabilities)]
-        print(prediction[1], ' ')
+        h = model_layers(h)
+        probabilities = softmax(tiedEmbeddings(h, lm.embedding_layer))
+        prediction = lm.vocab[findall(isequal(maximum(probabilities)), probabilities)[1]]
+        print(prediction, ' ')
         prediction == "_pad_" && break
     end
     println(prediction)
+end
+
+function gpu(lm::LanguageModel)
+    lm.embedding_layer = gpu(lm.embedding_layer)
+    lm.lstm_layer1 = gpu(lm.lstm_layer1)
+    lm.lstm_layer2 = gpu(lm.lstm_layer2)
+    lm.lstm_layer3 = gpu(lm.lstm_layer3)
+    return
 end
