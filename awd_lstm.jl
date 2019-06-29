@@ -6,7 +6,7 @@ using Flux
 import Flux: gate, tanh, σ, Tracker, params, gpu
 
 # Generates Mask
-dropMask(p, shape; type = Float32) = rand(type, shape...) .> p .* type(1/(1 - p))
+dropMask(p, shape; type = Float32) = (rand(type, shape...) .> p) .* type(1/(1 - p))
 
 # Converts vector of words to vector of one-hot vectors
 onehot(wordVect::Vector, vocab::Vector) =
@@ -71,8 +71,8 @@ function WeightDroppedLSTM(a...; kw...)
 end
 
 function reset_masks!(wd::T) where T <: Flux.Recur{<:WeightDroppedLSTMCell}
-    wd.cell.maskWi = dropMask(wd.cell.p, size(wd.cell.Wi))
-    wd.cell.maskWh = dropMask(wd.cell.p, size(wd.cell.Wh))
+    wd.cell.maskWi = (wd.cell.maskWi <: Array) ? dropMask(wd.cell.p, size(wd.cell.Wi)) : gpu(dropMask(wd.cell.p, size(wd.cell.Wi)))
+    wd.cell.maskWh = (wd.cell.maskWh <: Array) ? dropMask(wd.cell.p, size(wd.cell.Wh)) : gpu(dropMask(wd.cell.p, size(wd.cell.Wh)))
     return nothing
 end
 ####################################################################
@@ -94,7 +94,12 @@ setTrigger!(trigger_point, m::AWD_LSTM) = m.T = trigger_point;
 
 function gpu(m::AWD_LSTM)
     m.layer = gpu(m.layer)
-    return
+    return nothing
+end
+
+function cpu(m::AWD_LSTM)
+    m.layer = cpu(m.layer)
+    return nothing
 end
 
 reset_masks!(awd::AWD_LSTM) = reset_masks!(awd.layer)
@@ -124,12 +129,22 @@ mutable struct VarDrop{F <: AbstractFloat, A <: AbstractArray}
     mask::A
 end
 
-VarDrop(shape, probability=0.0) = VarDrop(probability, gpu(dropMask(probability, shape)))
+VarDrop(shape, probability=0.0) = VarDrop{Float64, AbstractArray}(probability, gpu(dropMask(probability, shape)))
 
 (vd::VarDrop)(in) = in .* vd.mask
 
 function reset_masks!(vd::VarDrop)
-    vd.mask = gpu(dropMask(vd.p, size(vd.mask)))
+    vd.mask = (typeof(vd.mask) <: Array) ? dropMask(vd.p, size(vd.mask)) : gpu(dropMask(vd.p, size(vd.mask)))
+    return nothing
+end
+
+function gpu(vd::VarDrop)
+    vd.mask = Flux.gpu(vd.mask);
+    return nothing
+end
+
+function cpu(vd::VarDrop)
+    vd.mask = Flux.cpu(vd.mask);
     return nothing
 end
 ####################################################################
@@ -143,7 +158,7 @@ end
 
 DroppedEmbeddings(in::Integer, embed_size::Integer,
     probability::Float64=0.0; init = Flux.glorot_uniform) =
-        DroppedEmbeddings(
+        DroppedEmbeddings{Float64, AbstractArray}(
             param(init(in, embed_size)),
             probability,
             dropMask(probability, (in, 1))
@@ -156,11 +171,17 @@ Flux.@treelike DroppedEmbeddings
 function gpu(de::DroppedEmbeddings)
     de.emb = Flux.gpu(de.emb)
     de.mask = Flux.gpu(de.mask)
-    return de
+    return nothing
+end
+
+function cpu(de::DroppedEmbeddings)
+    de.emb = Flux.cpu(de.emb)
+    de.mask = Flux.cpu(de.mask)
+    return nothing
 end
 
 function reset_masks!(de::DroppedEmbeddings)
-    de.mask = dropMask(de.p, (size(de.emb, 1), 1))
+    de.mask = (typeof(de.mask) <: Array) ? dropMask(vd.p, size(vd.mask)) : gpu(dropMask(de.p, size(de.mask)))
     return nothing
 end
 
