@@ -1,5 +1,5 @@
 """
-Weight-Dropped LSTM
+ASGD Weight-Dropped LSTM
 """
 
 using Flux
@@ -7,19 +7,6 @@ import Flux: gate, tanh, σ, Tracker, params, gpu
 
 # Generates Mask
 dropMask(p, shape; type = Float32) = (rand(type, shape...) .> p) .* type(1/(1 - p))
-
-# Converts vector of words to vector of one-hot vectors
-onehot(wordVect::Vector, vocab::Vector) =
-    oh_repr = broadcast(x -> (x ∈ vocab) ? Flux.onehot(x, vocab) : Flux.onehot("_unk_", vocab), wordVect)
-
-#Adding "<pad>" keyowrd at the end if the length of the sentence is < bptt
-function padding(batches::Vector)
-    n = maximum([length(x) for x in batches])
-    return ([length(batch) < n ? cat(batch, repeat(["<pos>"], n-length(batch)); dims = 1) : batch[1:n] for batch in batches], n)
-end
-
-# To initialize funciton for model LSTM weights
-init_weights(extreme::AbstractFloat, dims...) = randn(Float32, dims...) .* sqrt(Float32(extreme))
 
 #################### Weight-Dropped LSTM Cell#######################
 mutable struct WeightDroppedLSTMCell{A, V, M}
@@ -123,6 +110,10 @@ function asgd_step!(iter, layer::AWD_LSTM)
 end
 ####################################################################
 
+"""
+Variational Dropout
+"""
+
 ########################## Varitional DropOut ######################
 mutable struct VarDrop{F <: AbstractFloat, A <: AbstractArray}
     p::F
@@ -148,6 +139,10 @@ function cpu(vd::VarDrop)
     return nothing
 end
 ####################################################################
+
+"""
+Embeddings with varitional dropout
+"""
 
 ################# Varitional Dropped Embeddings ####################
 mutable struct DroppedEmbeddings{F <: AbstractFloat, A <: AbstractArray}

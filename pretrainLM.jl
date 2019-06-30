@@ -12,12 +12,9 @@ using BSON: @save, @load  # For saving model weights
 # using CuArrays  # For GPU support
 
 cd(@__DIR__)
-
-# import AWD_LSTM layer
-include("awd_lstm.jl")
-
-# including WikiText-103 Corpus
-include("WikiText103_DataDeps.jl")
+include("awd_lstm.jl")      # importing AWD_LSTM (ASGD Weight-Dropped LSTM)
+include("utils.jl")     # including some functions
+include("WikiText103_DataDeps.jl")      # including WikiText-103 Corpus
 
 # Loading Corpus
 function loadCorpus(corpuspath::String = joinpath(datadep"WikiText-103", "wiki.train.tokens"))
@@ -101,7 +98,7 @@ end
 
 # Funciton for training Language Model
 function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,gradient_clip::Float64=0.25,
-        initLearnRate::Number=30, epochs::Integer=1, α::Number=2, β::Number=1, checkpointIter::Integer=5000)
+        initLearnRate::Number=30, epochs::Integer=1, α::Number=2, β::Number=1, checkpoint_iter::Integer=5000)
 
     # Initializations
     gen = Channel(x -> generator(x, loadCorpus(); batchsize = batchsize, bptt = bptt))
@@ -135,13 +132,13 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,gradien
             # BACKWARD
             back!(p, l, opt, gradient_clip)
 
-            #ASGD Step
+            # ASGD Step, after Triggering
             asgd_step!.(i, [lm.lstm_layer1,lm.lstm_layer2,lm.lstm_layer3])
 
             println("loss: $l", " iteration number: $i")
 
             # Saving checkpoints
-            if i == checkpointIter save_model!(lm) end
+            if i == checkpoint_iter save_model!(lm) end
         end
     end
 end
@@ -151,6 +148,7 @@ function save_model!(lm::LanguageModel, filepath::String="ULMFiT-LM.bson")
     weights = Tracker.data.(params(lm))
     @save filepath weights
 end
+
 # To load model
 function load_model!(lm::LanguageModel, filepath::String=joinpath(datadep"pretrained-ULMFiT", "weights.bson"))
     @load filepath weights
@@ -167,6 +165,15 @@ function load_model!(filepath::String)
     lm = LanguageModel()
     load_model!(lm, filepath)
     return lm
+end
+
+# Converts parameters and masks to CuArrays for GPU support
+function gpu(lm::LanguageModel)
+    lm.embedding_layer = gpu(lm.embedding_layer)
+    lm.lstm_layer1 = gpu(lm.lstm_layer1)
+    lm.lstm_layer2 = gpu(lm.lstm_layer2)
+    lm.lstm_layer3 = gpu(lm.lstm_layer3)
+    return
 end
 
 # Sampling
@@ -197,12 +204,4 @@ function sampling(starting_text::String, lm::LanguageModel=load_model!())
         prediction == "_pad_" && break
     end
     println(prediction)
-end
-
-function gpu(lm::LanguageModel)
-    lm.embedding_layer = gpu(lm.embedding_layer)
-    lm.lstm_layer1 = gpu(lm.lstm_layer1)
-    lm.lstm_layer2 = gpu(lm.lstm_layer2)
-    lm.lstm_layer3 = gpu(lm.lstm_layer3)
-    return
 end
