@@ -43,7 +43,7 @@ function fineTuneLM(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70, 
     p = params(lm)
     H_prev = repeat([zeros(Float32, length(lm.vocab), batchsize)], bptt)
 
-    model_layers = Chain(
+    model_layers = [
         lm.embedding_layer,
         VarDrop((size(lm.embedding_layer.emb, 2), batchsize), lm.wordDropProb),
         lm.lstm_layer1,
@@ -52,9 +52,7 @@ function fineTuneLM(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70, 
         VarDrop((size(lm.lstm_layer2.layer.cell.h, 1), batchsize), lm.LayerDropProb),
         lm.lstm_layer3,
         VarDrop((size(lm.lstm_layer3.layer.cell.h, 1), batchsize), lm.FinalDropProb),
-        x -> tiedEmbeddings(x, lm.embedding_layer),
-        softmax
-    )
+    ]
 
     # Fine-Tuning loops
     for epoch=1:epochs

@@ -3,7 +3,7 @@ ASGD Weight-Dropped LSTM
 """
 
 using Flux
-import Flux: gate, tanh, σ, Tracker, params, gpu
+import Flux: gate, tanh, σ, Tracker, params, gpu, cpu
 
 # Generates Mask
 dropMask(p, shape; type = Float32) = (rand(type, shape...) .> p) .* type(1/(1 - p))
@@ -58,8 +58,8 @@ function WeightDroppedLSTM(a...; kw...)
 end
 
 function reset_masks!(wd::T) where T <: Flux.Recur{<:WeightDroppedLSTMCell}
-    wd.cell.maskWi = (wd.cell.maskWi <: Array) ? dropMask(wd.cell.p, size(wd.cell.Wi)) : gpu(dropMask(wd.cell.p, size(wd.cell.Wi)))
-    wd.cell.maskWh = (wd.cell.maskWh <: Array) ? dropMask(wd.cell.p, size(wd.cell.Wh)) : gpu(dropMask(wd.cell.p, size(wd.cell.Wh)))
+    wd.cell.maskWi = (typeof(wd.cell.maskWi) <: Array) ? dropMask(wd.cell.p, size(wd.cell.Wi)) : gpu(dropMask(wd.cell.p, size(wd.cell.Wi)))
+    wd.cell.maskWh = (typeof(wd.cell.maskWh) <: Array) ? dropMask(wd.cell.p, size(wd.cell.Wh)) : gpu(dropMask(wd.cell.p, size(wd.cell.Wh)))
     return nothing
 end
 ####################################################################
@@ -79,14 +79,14 @@ Flux.@treelike AWD_LSTM
 
 setTrigger!(trigger_point, m::AWD_LSTM) = m.T = trigger_point;
 
-function gpu(m::AWD_LSTM)
+function gpu!(m::AWD_LSTM)
     m.layer = gpu(m.layer)
-    return nothing
+    return
 end
 
-function cpu(m::AWD_LSTM)
+function cpu!(m::AWD_LSTM)
     m.layer = cpu(m.layer)
-    return nothing
+    return
 end
 
 reset_masks!(awd::AWD_LSTM) = reset_masks!(awd.layer)
@@ -120,7 +120,7 @@ mutable struct VarDrop{F <: AbstractFloat, A <: AbstractArray}
     mask::A
 end
 
-VarDrop(shape, probability=0.0) = VarDrop{Float64, AbstractArray}(probability, gpu(dropMask(probability, shape)))
+VarDrop(shape, probability=0.0) = VarDrop{Float64, AbstractArray}(probability, dropMask(probability, shape))
 
 (vd::VarDrop)(in) = in .* vd.mask
 
@@ -129,14 +129,14 @@ function reset_masks!(vd::VarDrop)
     return nothing
 end
 
-function gpu(vd::VarDrop)
-    vd.mask = Flux.gpu(vd.mask);
-    return nothing
+function gpu!(vd::VarDrop)
+    vd.mask = gpu(vd.mask);
+    return
 end
 
-function cpu(vd::VarDrop)
-    vd.mask = Flux.cpu(vd.mask);
-    return nothing
+function cpu!(vd::VarDrop)
+    vd.mask = cpu(vd.mask);
+    return
 end
 ####################################################################
 
@@ -145,43 +145,43 @@ Embeddings with varitional dropout
 """
 
 ################# Varitional Dropped Embeddings ####################
-mutable struct DroppedEmbeddings{F <: AbstractFloat, A <: AbstractArray}
+mutable struct DroppedEmbeddings{A}
     emb::TrackedArray
-    p::F
+    p::Float64
     mask::A
 end
 
-DroppedEmbeddings(in::Integer, embed_size::Integer,
-    probability::Float64=0.0; init = Flux.glorot_uniform) =
-        DroppedEmbeddings{Float64, AbstractArray}(
+DroppedEmbeddings(in::Integer, embed_size::Integer, probability::Float64=0.0;
+    init = Flux.glorot_uniform) =
+        DroppedEmbeddings{AbstractArray}(
             param(init(in, embed_size)),
             probability,
             dropMask(probability, (in, 1))
         )
 
-(de::DroppedEmbeddings)(in::AbstractArray) = transpose((de.emb .* de.mask))*in
+function (de::DroppedEmbeddings)(in::AbstractArray, tying=false)
+    dropped = de.emb .* de.mask
+    return tying ? dropped * in : transpose(dropped[in, :])
+end
 
 Flux.@treelike DroppedEmbeddings
 
-function gpu(de::DroppedEmbeddings)
-    de.emb = Flux.gpu(de.emb)
-    de.mask = Flux.gpu(de.mask)
-    return nothing
+function gpu!(de::DroppedEmbeddings)
+    de.emb = gpu(de.emb)
+    de.mask = gpu(de.mask)
+    return
 end
 
-function cpu(de::DroppedEmbeddings)
-    de.emb = Flux.cpu(de.emb)
-    de.mask = Flux.cpu(de.mask)
-    return nothing
+function cpu!(de::DroppedEmbeddings)
+    de.emb = cpu(de.emb)
+    de.mask = cpu(de.mask)
+    return
 end
 
 function reset_masks!(de::DroppedEmbeddings)
-    de.mask = (typeof(de.mask) <: Array) ? dropMask(vd.p, size(vd.mask)) : gpu(dropMask(de.p, size(de.mask)))
+    de.mask = (typeof(de.mask) <: Array) ? dropMask(de.p, size(de.mask)) : gpu(dropMask(de.p, size(de.mask)))
     return nothing
 end
-
-# Weight-tying
-tiedEmbeddings(in::AbstractArray, de::DroppedEmbeddings) = (de.emb .* de.mask)*in
 ####################################################################
 
 # Reset's dropping probability

@@ -46,7 +46,7 @@ mutable struct LanguageModel
             LayerDropProb,
             FinalDropProb
         )
-        lm.embedding_layer = DroppedEmbeddings(length(lm.vocab), 400, 0.1; init = (dims...) -> init_weights(0.1, dims...))
+        lm.embedding_layer = DroppedEmbeddings(length(lm.vocab), 400, 0.1, true; init = (dims...) -> init_weights(0.1, dims...))
         return lm
     end
 end
@@ -67,13 +67,20 @@ end
 
 # Forward pass
 function forward(model_layers, batch::AbstractVector, lm::LanguageModel, batchsize::Integer, H_prev::AbstractArray, α, β)
-    batch = broadcast(x -> hcat(onehot(x, lm.vocab)...), batch)
-    reset_masks!.(model_layers[1:end-2])
-    batch = broadcast(x -> model_layers(gpu(x)), batch)
+    batch = broadcast(x -> indices(x), batch)
+    reset_masks!.(model_layers)
+    for layer in model_layers
+        gpu!(layer)
+        batch = broadcast(x ->cpu(layer(gpu(x))), batch)
+        cpu!(layer)
+    end
+    gpu!(lm.embedding_layer)
+    batch = broadcast(x -> cpu(softmax(lm.embedding_layer(gpu(x), true))), batch)
+    cpu!(model_layers[1])
 
     Y = take!(gen)
     Y = broadcast(y -> gpu(hcat(onehot(y, lm.vocab)...)), Y)
-    l = loss(batch, Y, gpu.(H_prev), α, β)
+    l = loss(batch, Y, H_prev, α, β)
 
     return l, Tracker.data.(batch)
 end
@@ -81,7 +88,7 @@ end
 # loss funciton - Loss calculation with AR and TAR regulatization
 function loss(H, Y, H_prev, α, β)
     expr(ht, yt, ht_prev) = sum(crossentropy(ht, yt)) + α*sum(norm, ht) + β*sum(norm, ht .- ht_prev)
-    l = sum(broadcast((ht, yt, ht_prev) -> expr(ht, yt, ht_prev), batch, Y, H_prev))
+    l = sum(broadcast((ht, yt, ht_prev) -> cpu(expr(gpu(ht), gpu(yt), gpu(ht_prev))), batch, Y, H_prev))
     Flux.truncate!(lm)
     return l, Tracker.data.(H)
 end
@@ -108,7 +115,7 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,gradien
     p = params(lm)
     H_prev = repeat([zeros(Float32, length(lm.vocab), batchsize)], bptt)
 
-    model_layers = Chain(
+    model_layers = [
         lm.embedding_layer,
         VarDrop((size(lm.embedding_layer.emb, 2), batchsize), lm.wordDropProb),
         lm.lstm_layer1,
@@ -117,9 +124,7 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,gradien
         VarDrop((size(lm.lstm_layer2.layer.cell.h, 1), batchsize), lm.LayerDropProb),
         lm.lstm_layer3,
         VarDrop((size(lm.lstm_layer3.layer.cell.h, 1), batchsize), lm.FinalDropProb),
-        x -> tiedEmbeddings(x, lm.embedding_layer),
-        softmax
-    )
+    ]
 
     # Pre-Training loops
     for epoch=1:epochs
@@ -168,11 +173,19 @@ function load_model!(filepath::String)
 end
 
 # Converts parameters and masks to CuArrays for GPU support
-function gpu(lm::LanguageModel)
+function gpu!(lm::LanguageModel)
     lm.embedding_layer = gpu(lm.embedding_layer)
-    lm.lstm_layer1 = gpu(lm.lstm_layer1)
-    lm.lstm_layer2 = gpu(lm.lstm_layer2)
-    lm.lstm_layer3 = gpu(lm.lstm_layer3)
+    lm.lstm_layer1 = gpu!(lm.lstm_layer1)
+    lm.lstm_layer2 = gpu!(lm.lstm_layer2)
+    lm.lstm_layer3 = gpu!(lm.lstm_layer3)
+    return
+end
+
+function cpu!(lm::LanguageModel)
+    lm.embedding_layer = cpu!(lm.embedding_layer)
+    lm.lstm_layer1 = cpu!(lm.lstm_layer1)
+    lm.lstm_layer2 = cpu!(lm.lstm_layer2)
+    lm.lstm_layer3 = cpu!(lm.lstm_layer3)
     return
 end
 
