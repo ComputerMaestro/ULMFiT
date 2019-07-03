@@ -60,7 +60,7 @@ end
 function reset_masks!(wd::T) where T <: Flux.Recur{<:WeightDroppedLSTMCell}
     wd.cell.maskWi = (typeof(wd.cell.maskWi) <: Array) ? dropMask(wd.cell.p, size(wd.cell.Wi)) : gpu(dropMask(wd.cell.p, size(wd.cell.Wi)))
     wd.cell.maskWh = (typeof(wd.cell.maskWh) <: Array) ? dropMask(wd.cell.p, size(wd.cell.Wh)) : gpu(dropMask(wd.cell.p, size(wd.cell.Wh)))
-    return nothing
+    return
 end
 ####################################################################
 
@@ -77,7 +77,7 @@ Flux.@treelike AWD_LSTM
 
 (m::AWD_LSTM)(in) = m.layer(in)
 
-setTrigger!(trigger_point, m::AWD_LSTM) = m.T = trigger_point;
+set_trigger!(trigger_point::Integer, m::AWD_LSTM) = m.T = trigger_point;
 
 function gpu!(m::AWD_LSTM)
     m.layer = gpu(m.layer)
@@ -93,20 +93,25 @@ reset_masks!(awd::AWD_LSTM) = reset_masks!(awd.layer)
 
 # Averaged Stochastic Gradient Descent Step
 function asgd_step!(iter, layer::AWD_LSTM)
+    gpu!(layer)
+    layer.accum = gpu.(layer.accum)
     p = params(layer)
     if iter >= layer.T
         avg_fact = 1/max(iter - layer.T + 1, 1)
         if avg_fact != 1
             layer.accum = layer.accum + Tracker.data.(p)
-            iter = 1
+            i = 1
             for ps in p
                 ps.data .= avg_fact*copy(layer.accum[iter])
-                iter += 1
+                i += 1
             end
         else
-            layer.accumu = deepcopy(Tracker.data.(p))   # Accumulator for ASGD
+            layer.accum = deepcopy(Tracker.data.(p))   # Accumulator for ASGD
         end
     end
+    layer.accum = cpu.(layer.accum)
+    cpu!(layer)
+    return
 end
 ####################################################################
 
@@ -126,7 +131,7 @@ VarDrop(shape, probability=0.0) = VarDrop{Float64, AbstractArray}(probability, d
 
 function reset_masks!(vd::VarDrop)
     vd.mask = (typeof(vd.mask) <: Array) ? dropMask(vd.p, size(vd.mask)) : gpu(dropMask(vd.p, size(vd.mask)))
-    return nothing
+    return
 end
 
 function gpu!(vd::VarDrop)
@@ -180,14 +185,14 @@ end
 
 function reset_masks!(de::DroppedEmbeddings)
     de.mask = (typeof(de.mask) <: Array) ? dropMask(de.p, size(de.mask)) : gpu(dropMask(de.p, size(de.mask)))
-    return nothing
+    return
 end
 ####################################################################
 
 # Reset's dropping probability
 function reset_probability!(new_p, m::WeightDroppedLSTMCell)
     m.p = new_p
-    return nothing
+    return
 end
 
 reset_probability!(new_p, m::Flux.Recur{<:WeightDroppedLSTMCell}) = reset_probability!(new_p, m.cell)
@@ -195,10 +200,10 @@ reset_probability!(new_p, m::AWD_LSTM) = reset_probability!(new_p, m.layer.cell)
 
 function reset_probability!(new_p, m::VarDrop)
     m.p = new_p
-    return nothing
+    return
 end
 
 function reset_probability!(new_p, m::DroppedEmbeddings)
     m.p = new_p
-    return nothing
+    return
 end

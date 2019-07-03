@@ -12,10 +12,10 @@ function indices(wordVect::Vector, vocab::Vector, unk)
     return broadcast(x -> index(x, unk), wordVect)
 end
 
-#Adding "<pad>" keyowrd at the end if the length of the sentence is < bptt
+#Adding "_pad_" keyowrd at the end if the length of the sentence is < bptt
 function padding(batches::Vector)
     n = maximum([length(x) for x in batches])
-    return ([length(batch) < n ? cat(batch, repeat(["<pos>"], n-length(batch)); dims = 1) : batch[1:n] for batch in batches], n)
+    return ([length(batch) < n ? cat(batch, repeat(["_pad_"], n-length(batch)); dims = 1) : batch[1:n] for batch in batches], n)
 end
 
 # To initialize funciton for model LSTM weights

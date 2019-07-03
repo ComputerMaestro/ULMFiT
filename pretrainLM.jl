@@ -6,7 +6,7 @@ using WordTokenizers   # For accesories
 using InternedStrings   # For using Interned strings
 using DelimitedFiles   # For reading and writing files
 using Flux  # For building models
-using Flux: Tracker, crossentropy, chunk, gpu
+using Flux: Tracker, crossentropy, chunk
 using LinearAlgebra: norm
 using BSON: @save, @load  # For saving model weights
 # using CuArrays  # For GPU support
@@ -46,7 +46,7 @@ mutable struct LanguageModel
             LayerDropProb,
             FinalDropProb
         )
-        lm.embedding_layer = DroppedEmbeddings(length(lm.vocab), 400, 0.1, true; init = (dims...) -> init_weights(0.1, dims...))
+        lm.embedding_layer = DroppedEmbeddings(length(lm.vocab), 400, 0.1; init = (dims...) -> init_weights(0.1, dims...))
         return lm
     end
 end
@@ -54,7 +54,7 @@ end
 Flux.@treelike LanguageModel
 
 # Generator, whenever it is called it gives one mini-batch
-function generator(c::Channel, corpus; batchsize::Integer=70, bptt::Integer=70)
+function generator(c::Channel, corpus; batchsize::Integer=64, bptt::Integer=70)
     X_total, n = padding(chunk(corpus, batchsize))
     put!(c, n)
     for i=1:Int(floor(n/bptt))
@@ -65,21 +65,33 @@ function generator(c::Channel, corpus; batchsize::Integer=70, bptt::Integer=70)
     end
 end
 
+# Computes output of the layer for given batch
+function compute_layer(layer, batch::AbstractArray)
+    gpu!(layer)
+    batch = broadcast(x -> cpu(layer(gpu(x))), batch)
+    cpu!(layer)
+    return batch
+end
+
+# Gradient Clipping
+grad_clipping(g, upper_bound) = min(g, upper_bound)
+
 # Forward pass
 function forward(model_layers, batch::AbstractVector, lm::LanguageModel, batchsize::Integer, H_prev::AbstractArray, α, β)
-    batch = broadcast(x -> indices(x), batch)
     reset_masks!.(model_layers)
+    batch = broadcast(x -> indices(x, lm.vocab, "_unk_"), batch)
+    gpu!(lm.embedding_layer)
+    batch = broadcast(x -> cpu(lm.embedding_layer(x)), batch)
+    cpu!(lm.embedding_layer)
     for layer in model_layers
-        gpu!(layer)
-        batch = broadcast(x ->cpu(layer(gpu(x))), batch)
-        cpu!(layer)
+        compute_layer(layer, batch)
     end
     gpu!(lm.embedding_layer)
     batch = broadcast(x -> cpu(softmax(lm.embedding_layer(gpu(x), true))), batch)
     cpu!(model_layers[1])
 
     Y = take!(gen)
-    Y = broadcast(y -> gpu(hcat(onehot(y, lm.vocab)...)), Y)
+    Y = broadcast(y -> Flux.onehotbatch(y, lm.vocab, "_unk_"), Y)
     l = loss(batch, Y, H_prev, α, β)
 
     return l, Tracker.data.(batch)
@@ -90,31 +102,22 @@ function loss(H, Y, H_prev, α, β)
     expr(ht, yt, ht_prev) = sum(crossentropy(ht, yt)) + α*sum(norm, ht) + β*sum(norm, ht .- ht_prev)
     l = sum(broadcast((ht, yt, ht_prev) -> cpu(expr(gpu(ht), gpu(yt), gpu(ht_prev))), batch, Y, H_prev))
     Flux.truncate!(lm)
-    return l, Tracker.data.(H)
+    return l
 end
 
 # Backward
 function back!(p::Flux.Params, l, opt, gradient_clip::Float64)
+    l = Tracker.hook(x -> grad_clipping(x, gradient_clip), l)
     grads = Tracker.gradient(() -> l, p)
-    for ps in p     # Applying Gradient clipping
-        grads[ps].data = min.(grads[ps].data, gradient_clip)
-    end
     Tracker.update!(opt, p, grads)
-    return nothing
+    return
 end
 
 # Funciton for training Language Model
-function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,gradient_clip::Float64=0.25,
-        initLearnRate::Number=30, epochs::Integer=1, α::Number=2, β::Number=1, checkpoint_iter::Integer=5000)
+function fit!(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70,gradient_clip::Float64=0.25,
+    base_lr=0.004, epochs::Integer=1, α::Number=2, β::Number=1, checkpoint_iter::Integer=5000)
 
-    # Initializations
-    gen = Channel(x -> generator(x, loadCorpus(); batchsize = batchsize, bptt = bptt))
-    opt = Descent(initLearnRate)    # Optimizer
-    num_of_batches = take!(gen) # Number of mini-batches
-    T = Int(floor((num_of_batches*2)/100))   # Averaging Trigger
-    p = params(lm)
-    H_prev = repeat([zeros(Float32, length(lm.vocab), batchsize)], bptt)
-
+    # All important layers for training
     model_layers = [
         lm.embedding_layer,
         VarDrop((size(lm.embedding_layer.emb, 2), batchsize), lm.wordDropProb),
@@ -123,8 +126,17 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,gradien
         lm.lstm_layer2,
         VarDrop((size(lm.lstm_layer2.layer.cell.h, 1), batchsize), lm.LayerDropProb),
         lm.lstm_layer3,
-        VarDrop((size(lm.lstm_layer3.layer.cell.h, 1), batchsize), lm.FinalDropProb),
+        VarDrop((size(lm.lstm_layer3.layer.cell.h, 1), batchsize), lm.FinalDropProb)
     ]
+
+    # Initializations
+    gen = Channel(x -> generator(x, loadCorpus(); batchsize = batchsize, bptt = bptt))
+    opt = ADAM(0.004, (0.7, 0.99))    # ADAM Optimizer
+    num_of_batches = take!(gen) # Number of mini-batches
+    T = Int(floor((num_of_batches*2)/100))   # Averaging Trigger
+    set_trigger!.(model_layers[[3, 5, 7]])  # Setting triggers for AWD_LSTM layers
+    p = params(lm)
+    H_prev = repeat([zeros(Float32, length(lm.vocab), batchsize)], bptt)
 
     # Pre-Training loops
     for epoch=1:epochs
@@ -135,6 +147,7 @@ function fit!(lm::LanguageModel; batchsize::Integer=70, bptt::Integer=70,gradien
             l, H_prev = forward(model_layers, take!(gen), lm, batchsize, H_prev, α, β)
 
             # BACKWARD
+            gpu!(lm)
             back!(p, l, opt, gradient_clip)
 
             # ASGD Step, after Triggering
@@ -201,8 +214,8 @@ function sampling(starting_text::String, lm::LanguageModel=load_model!())
     reset_masks!.(model_layers)
 
     tokens = tokenize(starting_text)
-    ohrep = onehot(tokens, lm.vocab)
-    embeddings = lm.embedding_layer.(ohrep)
+    word_indices = indices(tokens, lm.vocab, "_unk_")
+    embeddings = lm.embedding_layer.(word_indices)
     h = (model_layers.(embeddings))[end]
     probabilities = softmax(tiedEmbeddings(h, lm.embedding_layer))
     prediction = lm.vocab[findall(isequal(maximum(probabilities)), probabilities)[1]]
