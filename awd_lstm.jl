@@ -5,8 +5,10 @@ ASGD Weight-Dropped LSTM
 using Flux
 import Flux: gate, tanh, σ, Tracker, params, gpu, cpu
 
+include("utils.jl")
+
 # Generates Mask
-dropMask(p, shape; type = Float32) = (rand(type, shape...) .> p) .* type(1/(1 - p))
+dropMask(p, shape; alloc_func::Function=cpu, type = Float32) = alloc_func((rand(type, shape...) .> p) .* type(1/(1 - p)))
 
 #################### Weight-Dropped LSTM Cell#######################
 mutable struct WeightDroppedLSTMCell{A, V, M}
@@ -93,24 +95,20 @@ reset_masks!(awd::AWD_LSTM) = reset_masks!(awd.layer)
 
 # Averaged Stochastic Gradient Descent Step
 function asgd_step!(iter, layer::AWD_LSTM)
-    gpu!(layer)
-    layer.accum = gpu.(layer.accum)
-    p = params(layer)
     if iter >= layer.T
+        gpu!(layer)
+        layer.accum = gpu.(layer.accum)
+        p = params(layer)
         avg_fact = 1/max(iter - layer.T + 1, 1)
         if avg_fact != 1
-            layer.accum = layer.accum + Tracker.data.(p)
-            i = 1
-            for ps in p
-                ps.data .= avg_fact*copy(layer.accum[iter])
-                i += 1
-            end
+            layer.accum = layer.accum .+ Tracker.data.(p)
+            Flux.loadparams!(layer, layer.accum)
         else
             layer.accum = deepcopy(Tracker.data.(p))   # Accumulator for ASGD
         end
+        layer.accum = cpu.(layer.accum)
+        cpu!(layer)
     end
-    layer.accum = cpu.(layer.accum)
-    cpu!(layer)
     return
 end
 ####################################################################
@@ -120,14 +118,16 @@ Variational Dropout
 """
 
 ########################## Varitional DropOut ######################
-mutable struct VarDrop{F <: AbstractFloat, A <: AbstractArray}
+mutable struct VarDrop{F}
     p::F
-    mask::A
+    mask
+    VarDrop(probability::Float64=0.0) = new{AbstractFloat}(probability, Array{Float32, 2}(UndefInitializer(), 0, 0))
 end
 
-VarDrop(shape, probability=0.0) = VarDrop{Float64, AbstractArray}(probability, dropMask(probability, shape))
-
-(vd::VarDrop)(in) = in .* vd.mask
+function (vd::VarDrop)(inp)
+    !(size(inp) == size(vd.mask)) && (vd.mask = (isdefined(Main, :CuArray) && !(inp isa Array)) ? dropMask(vd.p, size(inp); alloc_func=gpu) : dropMask(vd.p, size(inp)))
+    inp .* vd.mask
+end
 
 function reset_masks!(vd::VarDrop)
     vd.mask = (typeof(vd.mask) <: Array) ? dropMask(vd.p, size(vd.mask)) : gpu(dropMask(vd.p, size(vd.mask)))
@@ -164,7 +164,7 @@ DroppedEmbeddings(in::Integer, embed_size::Integer, probability::Float64=0.0;
             dropMask(probability, (in, 1))
         )
 
-function (de::DroppedEmbeddings)(in::AbstractArray, tying=false)
+function (de::DroppedEmbeddings)(in::AbstractArray, tying::Bool=false)
     dropped = de.emb .* de.mask
     return tying ? dropped * in : transpose(dropped[in, :])
 end
@@ -207,3 +207,46 @@ function reset_probability!(new_p, m::DroppedEmbeddings)
     m.p = new_p
     return
 end
+
+####################################################################
+
+"""
+Concat-Pooled linear layer
+"""
+
+mutable struct PooledDense{F, S, T}
+    W::S
+    b::T
+    σ::F
+end
+
+PooledDense(W, b) = PooledDense(W, b, identity)
+
+function PooledDense(hidden_sz::Integer, out::Integer, σ = identity;
+             initW = Flux.glorot_uniform, initb = (dims...) -> zeros(Float32, dims...))
+return PooledDense(param(initW(out, hidden_sz*3)), param(initb(out)), σ)
+end
+
+Flux.@treelike PooledDense
+
+function (a::PooledDense)(in)
+    maxpool = max.(in...)
+    meanpool = mean.(in...)
+    hc = cat(in[end], maxpool, meanpool)
+    W, b, σ = a.W, a.b, a.σ
+    σ.(W*hc .+ b)
+end
+
+function gpu!(l::Union{PooledDense, Flux.Dense})
+    l.W = gpu(l.W)
+    l.b = gpu(l.b)
+    return
+end
+
+function cpu!(l::Union{PooledDense, Flux.Dense})
+    l.W = cpu(l.W)
+    l.b = cpu(l.b)
+    return
+end
+
+####################################################################

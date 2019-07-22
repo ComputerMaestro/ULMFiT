@@ -34,7 +34,7 @@ mutable struct LanguageModel
     FinalDropProb :: Float64
     embedding_layer :: DroppedEmbeddings
 
-    function LanguageModel(inLSTMSize::Integer=400, hidLSTMSize::Integer=1150, outLSTMSize::Integer=inLSTMSize;
+    function LanguageModel(inLSTMSize::Integer=400, hidLSTMSize::Integer=1150, outLSTMSize::Integer=inLSTMSize, embedding_size::Integer=400;
         embedDropProb::Float64 = 0.05, wordDropProb::Float64 = 0.4, hidDropProb::Float64 = 0.5, LayerDropProb::Float64 = 0.3, FinalDropProb::Float64 = 0.4)
         lm = new(
             intern.(string.(readdlm("vocab.csv",',', header=false)[:, 1])),
@@ -46,7 +46,7 @@ mutable struct LanguageModel
             LayerDropProb,
             FinalDropProb
         )
-        lm.embedding_layer = DroppedEmbeddings(length(lm.vocab), 400, 0.1; init = (dims...) -> init_weights(0.1, dims...))
+        lm.embedding_layer = DroppedEmbeddings(length(lm.vocab), embedding_size, 0.1; init = (dims...) -> init_weights(0.1, dims...))
         return lm
     end
 end
@@ -77,32 +77,20 @@ end
 calc_ar(H, α) = sum(map(x -> α*sum(norm, x), H))
 
 # Forward
-function compute_layer(layer, batch)
-    gpu!(layer)
-    batch = layer.(batch)
-    cpu!(layer)
-    return batch
-end
-
 function forward(lm, model_layers, batch, α, β)
-    reset_masks!.(model_layers[2:9])
-    gpu!(lm.embedding_layer)
-    batch = broadcast(x -> gpu(model_layers[1:2]), batch)
-    for layer in model_layers[2:7]
-        batch = compute_layer(layer, batch)
-    end
+    batch = broadcast(x -> gpu(model_layers[1](indices(x, lm.vocab, "_unk_"))), batch)
+    batch = model_layers[2:7].(batch)
     tar_value = calc_tar(batch, β)
-    batch = compute_layer(model_layers[8], batch)
+    batch = model_layers[8].(batch)
     ar_value = calc_ar(batch, α)
-    batch = broadcast(x -> cpu(model_layers[9:end](x)), batch)
-    cpu!(lm.embedding_layer)
+    batch = model_layers[9:end].(batch)
     return batch, ar_value, tar_value
 end
 
 # loss funciton - Loss calculation with AR and TAR regulatization
-function loss(lm, model_layers, X, Y, α, β)
-    H, ar_value, tar_value = forward(lm, model_layers, X, α, β)
-    Y = broadcast(x -> Flux.onehotbatch(x, lm.vocab, "_unk_"), Y)
+function loss(lm, model_layers, gen, α, β)
+    H, ar_value, tar_value = forward(lm, model_layers, take!(gen), α, β)
+    Y = broadcast(x -> Flux.onehotbatch(x, lm.vocab, "_unk_"), take!(gen))
     l = sum(crossentropy.(H, Y)) + ar_value + tar_value
     Flux.truncate!(model_layers)
     return l
@@ -120,20 +108,19 @@ function back!(p::Flux.Params, l, opt, gradient_clip::Float64)
 end
 
 # Funciton for training Language Model
-function fit!(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25,
+function fit!(lm::LanguageModel, model_layers=nothing; batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25,
     base_lr=0.004, epochs::Integer=1, α::Number=2, β::Number=1, checkpoint_iter::Integer=5000)
 
     # Chain of all important layers to pass from
     model_layers = Chain(
-        x -> indices(x, lm.vocab, "_unk_"),
         lm.embedding_layer,
-        VarDrop((size(lm.embedding_layer.emb, 2), batchsize), lm.wordDropProb),
-        lm.lstm_layer1,
-        VarDrop((size(lm.lstm_layer1.layer.cell.h, 1), batchsize), lm.LayerDropProb),
-        lm.lstm_layer2,
-        VarDrop((size(lm.lstm_layer2.layer.cell.h, 1), batchsize), lm.LayerDropProb),
-        lm.lstm_layer3,
-        VarDrop((size(lm.lstm_layer3.layer.cell.h, 1), batchsize), lm.FinalDropProb),
+        VarDrop(lm.wordDropProb),
+        lm.lstm_layer1.layer,
+        VarDrop(lm.LayerDropProb),
+        lm.lstm_layer2.layer,
+        VarDrop(lm.LayerDropProb),
+        lm.lstm_layer3.layer,
+        VarDrop(lm.FinalDropProb),
         x -> lm.embedding_layer(x, true),
         softmax
     )
@@ -144,7 +131,8 @@ function fit!(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, gradie
     num_of_batches = take!(gen) # Number of mini-batches
     T = Int(floor((num_of_batches*2)/100))   # Averaging Trigger
     set_trigger!.(T, model_layers[[3, 5, 7]])  # Setting triggers for AWD_LSTM layers
-    p = params(lm)
+    p = params(model_layers)
+    gpu!.(model_layers)
 
     # Pre-Training loops
     for epoch=1:epochs
@@ -152,9 +140,7 @@ function fit!(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, gradie
         for i=1:num_of_batches
 
             # FORWARD PROPAGATION
-            X = take!(gen)
-            Y = take!(gen)
-            l = loss(X, Y, lm, model_layers)
+            l = loss(lm, gen, α, β)
 
             # BACK PROPAGATION
             back!(p, l, opt, gradient_clip)
@@ -164,6 +150,8 @@ function fit!(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, gradie
 
             # ASGD Step, after Triggering
             asgd_step!.(i, [lm.lstm_layer1,lm.lstm_layer2,lm.lstm_layer3])
+
+            reset_masks!.(model_layers[1:8])
 
             println("loss: $l", " iteration number: $i")
 
@@ -194,34 +182,10 @@ end
 function load_model!(filepath::String)
     lm = LanguageModel()
     load_model!(lm, filepath)
-    return lm
-end
-
-# Converts parameters and masks to CuArrays for GPU support
-function gpu!(lm::LanguageModel)
-    lm.embedding_layer = gpu(lm.embedding_layer)
-    lm.lstm_layer1 = gpu!(lm.lstm_layer1)
-    lm.lstm_layer2 = gpu!(lm.lstm_layer2)
-    lm.lstm_layer3 = gpu!(lm.lstm_layer3)
-    return
-end
-
-function cpu!(lm::LanguageModel)
-    lm.embedding_layer = cpu!(lm.embedding_layer)
-    lm.lstm_layer1 = cpu!(lm.lstm_layer1)
-    lm.lstm_layer2 = cpu!(lm.lstm_layer2)
-    lm.lstm_layer3 = cpu!(lm.lstm_layer3)
-    return
 end
 
 # Sampling
-function sampling(starting_text::String, lm::LanguageModel=load_model!())
-    model_layers = Chain(
-        lm.lstm_layer1,
-        lm.lstm_layer2,
-        lm.lstm_layer3
-    )
-
+function sampling(starting_text::String, lm::LanguageModel=LanguageModel())
     reset_probability!.(0.0, model_layers)
     reset_masks!.(model_layers)
 
