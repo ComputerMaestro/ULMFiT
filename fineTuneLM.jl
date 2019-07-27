@@ -8,13 +8,8 @@ using Flux: Tracker
 
 cd(@__DIR__)
 include("pretrainLM.jl")    # importing LanguageModel and useful functions
-include("awd_lstm.jl")      # importing AWD_LSTM, VarDrop and DroppedEmbeddings
+include("custom_layers.jl")      # importing AWD_LSTM, VarDrop and DroppedEmbeddings
 include("utils.jl")         # importing utilities
-
-function data_loader(filepath::String)
-    targetData = read(open(filepath, "r"), String)
-    return intern.(tokenize(targetData))
-end
 
 function discriminative_step!(layers, ηL::Float64, l, gradient_clip::Float64, opts::Vector)
     # Applying gradient clipping
@@ -52,7 +47,7 @@ function fineTuneLM(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, 
         softmax
     )
 
-    gen = Channel(x -> generator(x, data_loader(); batchsize=batchsize, bptt=bptt))
+    gen = Channel(x -> generator(x, imdb_fine_tune_data(); batchsize=batchsize, bptt=bptt))
     opts = [ADAM(0.001, (0.7, 0.99)) for i=1:4]
     num_of_iters = take!(gen)
     T = Int(floor((num_of_iters*2)/100))

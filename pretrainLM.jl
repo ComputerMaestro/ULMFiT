@@ -12,15 +12,9 @@ using BSON: @save, @load  # For saving model weights
 # using CuArrays  # For GPU support
 
 cd(@__DIR__)
-include("awd_lstm.jl")      # importing AWD_LSTM (ASGD Weight-Dropped LSTM)
+include("custom_layers.jl")      # importing AWD_LSTM (ASGD Weight-Dropped LSTM)
 include("utils.jl")     # including some functions
 include("WikiText103_DataDeps.jl")      # including WikiText-103 Corpus
-
-# Loading Corpus
-function loadCorpus(corpuspath::String = joinpath(datadep"WikiText-103", "wiki.valid.tokens"))
-    corpus = read(open(corpuspath, "r"), String)
-    return intern.(tokenize(corpus))
-end
 
 # Language Model
 mutable struct LanguageModel
@@ -52,18 +46,6 @@ mutable struct LanguageModel
 end
 
 Flux.@treelike LanguageModel
-
-# Generator, whenever it is called it gives one mini-batch
-function generator(c::Channel, corpus; batchsize::Integer=64, bptt::Integer=70)
-    X_total, n = padding(chunk(corpus, batchsize))
-    put!(c, n)
-    for i=1:Int(floor(n/bptt))
-        start = bptt*(i-1) + 1
-        batch = [Flux.batch(X_total[k][j] for k=1:batchsize) for j=start:start+bptt]
-        put!(c, batch[1:end-1])
-        put!(c, batch[2:end])
-    end
-end
 
 # Calculates regularization TAR and AR
 function calc_tar(H, β)
@@ -186,6 +168,11 @@ end
 
 # Sampling
 function sampling(starting_text::String, lm::LanguageModel=LanguageModel())
+    model_layers = Chain(
+        lm.lstm_layer1,
+        lm.lstm_layer2,
+        lm.lstm_layer3,
+    )
     reset_probability!.(0.0, model_layers)
     reset_masks!.(model_layers)
 
