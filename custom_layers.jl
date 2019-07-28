@@ -3,7 +3,7 @@ ASGD Weight-Dropped LSTM
 """
 
 using Flux
-import Flux: gate, tanh, σ, Tracker, params, gpu, cpu
+import Flux: gate, tanh, σ, Tracker, params, gpu, cpu, _testmode!
 
 include("utils.jl")
 
@@ -20,6 +20,7 @@ mutable struct WeightDroppedLSTMCell{A, V, M}
     p::Float64
     maskWi::M
     maskWh::M
+    active::Bool
 end
 
 function WeightDroppedLSTMCell(in::Integer, out::Integer, probability::Float64=0.0;
@@ -32,7 +33,8 @@ function WeightDroppedLSTMCell(in::Integer, out::Integer, probability::Float64=0
         param(zeros(Float32, out)),
         probability,
         dropMask(probability, (out*4, in)),
-        dropMask(probability, (out*4, out))
+        dropMask(probability, (out*4, out)),
+        true
     )
     cell.b.data[gate(out, 2)] .= 1
     return cell
@@ -40,7 +42,9 @@ end
 
 function (m::WeightDroppedLSTMCell)((h, c), x)
     b, o = m.b, size(h, 1)
-    g = (m.Wi .* m.maskWi)*x .+ (m.Wh .* m.maskWh)*h .+ b
+    Wi = m.active ? m.Wi .* m.maskWi : m.Wi
+    Wh = m.active ? m.Wh .* m.maskWh : m.Wh
+    g = Wi*x .+ Wh*h .+ b
     input = σ.(gate(g, o, 1))
     forget = σ.(gate(g, o, 2))
     cell = tanh.(gate(g, o, 3))
@@ -51,6 +55,8 @@ function (m::WeightDroppedLSTMCell)((h, c), x)
 end
 
 Flux.@treelike WeightDroppedLSTMCell
+
+_testmode!(m::WeightDroppedLSTMCell, test) = (m.active = !test)
 
 # Weight-Dropped LSTM [stateful]
 function WeightDroppedLSTM(a...; kw...)
@@ -121,13 +127,17 @@ Variational Dropout
 mutable struct VarDrop{F}
     p::F
     mask
-    VarDrop(probability::Float64=0.0) = new{AbstractFloat}(probability, Array{Float32, 2}(UndefInitializer(), 0, 0))
+    active::Bool
+    VarDrop(probability::Float64=0.0) = new{AbstractFloat}(probability, Array{Float32, 2}(UndefInitializer(), 0, 0), true)
 end
 
 function (vd::VarDrop)(inp)
+    vd.active || inp
     !(size(inp) == size(vd.mask)) && (vd.mask = (isdefined(Main, :CuArray) && !(inp isa Array)) ? dropMask(vd.p, size(inp); alloc_func=gpu) : dropMask(vd.p, size(inp)))
     inp .* vd.mask
 end
+
+_testmode!(vd::VarDrop, test) = (vd.active = !test)
 
 function reset_masks!(vd::VarDrop)
     vd.mask = (typeof(vd.mask) <: Array) ? dropMask(vd.p, size(vd.mask)) : gpu(dropMask(vd.p, size(vd.mask)))
@@ -154,6 +164,7 @@ mutable struct DroppedEmbeddings{A}
     emb::TrackedArray
     p::Float64
     mask::A
+    active::Bool
 end
 
 DroppedEmbeddings(in::Integer, embed_size::Integer, probability::Float64=0.0;
@@ -161,15 +172,18 @@ DroppedEmbeddings(in::Integer, embed_size::Integer, probability::Float64=0.0;
         DroppedEmbeddings{AbstractArray}(
             param(init(in, embed_size)),
             probability,
-            dropMask(probability, (in, 1))
+            dropMask(probability, (in, 1)),
+            true
         )
 
 function (de::DroppedEmbeddings)(in::AbstractArray, tying::Bool=false)
-    dropped = de.emb .* de.mask
+    dropped = de.active ? de.emb .* de.mask : de.emb
     return tying ? dropped * in : transpose(dropped[in, :])
 end
 
 Flux.@treelike DroppedEmbeddings
+
+_testmode!(de::DroppedEmbeddings, test) = (de.active = !test)
 
 function gpu!(de::DroppedEmbeddings)
     de.emb = gpu(de.emb)

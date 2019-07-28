@@ -32,7 +32,7 @@ end
 
 # Fine-Tuning Language Model
 function fineTuneLM(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25,
-        ηL::Float64=4e-3, stlr_cut_frac::Float64=0.1, stlr_η_max::Float64=0.01, stlr_ratio::Float32=32,  α::Number=2, β::Number=1, epochs::Integer=1, checkpoint_itvl::Integer=5000)
+        ηL::Float64=4e-3, stlr_cut_frac::Float64=0.1, stlr_η_max::Float64=0.01, stlr_ratio::Float32=32, epochs::Integer=1, checkpoint_itvl::Integer=5000)
 
     model_layers = Chain(
         lm.embedding_layer,
@@ -47,23 +47,22 @@ function fineTuneLM(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, 
         softmax
     )
 
-    gen = Channel(x -> generator(x, imdb_fine_tune_data(); batchsize=batchsize, bptt=bptt))
     opts = [ADAM(0.001, (0.7, 0.99)) for i=1:4]
-    num_of_iters = take!(gen)
-    T = Int(floor((num_of_iters*2)/100))
-    set_trigger!.(T, model_layers[[3, 5, 7]])
     gpu!.(model_layers)
 
     # Fine-Tuning loops
     for epoch=1:epochs
-        println("\nEpoch: $epoch")
+        gen = Channel(x -> generator(x, imdb_fine_tune_data(); batchsize=batchsize, bptt=bptt))
+        num_of_iters = take!(gen)
+        T = Int(floor((num_of_iters*2)/100))
+        set_trigger!.(T, model_layers[[3, 5, 7]])
+        cut = T * stlr_cut_frac
         for i=1:num_of_iters
 
             # FORWARD
-            l = loss(lm, model_layers, gen, α, β)
+            l = loss(lm, model_layers, gen)
 
             # Slanted triangular learning rate step
-            cut = T * stlr_cut_frac
             p_frac = (i < cut) ? i/cut : (1 - ((i-cut)/(cut*(1/stlr_cut_frac-1))))
             ηL = stlr_η_max*((1+p_frac*(stlr_ratio-1))/stlr_ratio)
 
@@ -78,5 +77,6 @@ function fineTuneLM(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, 
             # Saving checkpoints
             if i == checkpoint_itvl save_model!(lm) end
         end
+        println("\nEpoch: $epoch")
     end
 end

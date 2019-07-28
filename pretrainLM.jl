@@ -47,33 +47,18 @@ end
 
 Flux.@treelike LanguageModel
 
-# Calculates regularization TAR and AR
-function calc_tar(H, β)
-    val = 0.0f0
-    for i=1:length(H)-1
-        val += β*sum(norm, H[i] .- H[i+1])
-    end
-    return val
-end
-
-calc_ar(H, α) = sum(map(x -> α*sum(norm, x), H))
-
 # Forward
-function forward(lm, model_layers, batch, α, β)
+function forward(lm, model_layers, batch)
     batch = broadcast(x -> gpu(model_layers[1](indices(x, lm.vocab, "_unk_"))), batch)
-    batch = model_layers[2:7].(batch)
-    tar_value = calc_tar(batch, β)
-    batch = model_layers[8].(batch)
-    ar_value = calc_ar(batch, α)
-    batch = model_layers[9:end].(batch)
-    return batch, ar_value, tar_value
+    batch = model_layers[2:end].(batch)
+    return batch
 end
 
 # loss funciton - Loss calculation with AR and TAR regulatization
-function loss(lm, model_layers, gen, α, β)
-    H, ar_value, tar_value = forward(lm, model_layers, take!(gen), α, β)
+function loss(lm, model_layers, gen)
+    H = forward(lm, model_layers, take!(gen))
     Y = broadcast(x -> Flux.onehotbatch(x, lm.vocab, "_unk_"), take!(gen))
-    l = sum(crossentropy.(H, Y)) + ar_value + tar_value
+    l = sum(crossentropy.(H, Y))
     Flux.truncate!(model_layers)
     return l
 end
@@ -91,7 +76,7 @@ end
 
 # Funciton for training Language Model
 function fit!(lm::LanguageModel, model_layers=nothing; batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25,
-    base_lr=0.004, epochs::Integer=1, α::Number=2, β::Number=1, checkpoint_iter::Integer=5000)
+    base_lr=0.004, epochs::Integer=1, checkpoint_iter::Integer=5000)
 
     # Chain of all important layers to pass from
     model_layers = Chain(
@@ -122,7 +107,7 @@ function fit!(lm::LanguageModel, model_layers=nothing; batchsize::Integer=64, bp
         for i=1:num_of_batches
 
             # FORWARD PROPAGATION
-            l = loss(lm, gen, α, β)
+            l = loss(lm, model_layers, gen)
 
             # BACK PROPAGATION
             back!(p, l, opt, gradient_clip)
@@ -164,33 +149,4 @@ end
 function load_model!(filepath::String)
     lm = LanguageModel()
     load_model!(lm, filepath)
-end
-
-# Sampling
-function sampling(starting_text::String, lm::LanguageModel=LanguageModel())
-    model_layers = Chain(
-        lm.lstm_layer1,
-        lm.lstm_layer2,
-        lm.lstm_layer3,
-    )
-    reset_probability!.(0.0, model_layers)
-    reset_masks!.(model_layers)
-
-    tokens = tokenize(starting_text)
-    word_indices = map(x -> indices([x], lm.vocab, "_unk_"), tokens)
-    embeddings = lm.embedding_layer.(word_indices)
-    h = (model_layers.(embeddings))[end]
-    probabilities = softmax(lm.embedding_layer(h, true))
-    prediction = lm.vocab[findall(isequal(maximum(probabilities)), probabilities)[1]]
-    println("SAMPLING...")
-    print(prediction, ' ')
-
-    while true
-        h = lm.embedding_layer(indices([prediction], lm.vocab, "_unk_"))
-        h = model_layers(h)
-        probabilities = softmax(lm.embedding_layer(h, true))
-        prediction = lm.vocab[findall(isequal(maximum(probabilities)), probabilities)[1]]
-        print(prediction, ' ')
-        prediction == "_pad_" && break
-    end
 end

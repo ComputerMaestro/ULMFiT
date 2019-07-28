@@ -26,21 +26,18 @@ function get_classifier(lm::LanguageModel=load_model!(), clsfr_out_sz::Integer=2
 end
 
 # Forward step for classifier
-function forward(lm, encoder, decoder, gen, α, β)
+function forward(lm, encoder, decoder, gen)
     batch = broadcast(x -> gpu(encoder[1](indices(x, lm.vocab, "_unk_"))), batch)
-    batch = encoder[2:7].(batch)
-    tar_value = calc_tar(batch, β)
-    batch = encoder[8].(batch)
-    ar_value = calc_ar(batch, α)
+    batch = encoder[2:end].(batch)
     batch = decoder(batch)
-    return batch, ar_value, tar_value
+    return batch
 end
 
 # Loss function for classifier
-function loss(lm, classifier, gen, α, β)
-    H, ar_value, tar_value = forward(lm, classifier[1:8], classifier[9:end], take!(gen), α, β)
+function loss(lm, classifier, gen)
+    H = forward(lm, classifier[1:8], classifier[9:end], take!(gen))
     Y = gpu.(take!(gen))
-    l = sum(crossentropy.(H, Y)) + ar_value + tar_value
+    l = sum(crossentropy.(H, Y))
     Flux.reset!(model_layers)
     return l
 end
@@ -57,11 +54,11 @@ function train_classifier(lm::LanguageModel, batchsize::Integer=64, bptt::Intege
         num_of_iters = take!(gen)
         T = Int(floor((num_of_iters*2)/100))
         set_trigger!.(T, [lm.lstm_layer1, lm.lstm_layer2, lm.lstm_layer3])
+        cut = T * stlr_cut_frac
         for iter=1:num_of_iters
-            l = loss(lm, classifier, gen, α, β)
+            l = loss(lm, classifier, gen)
 
             # Slanted triangular learning rates
-            cut = T * stlr_cut_frac
             p_frac = (iter < cut) ? iter/cut : (1 - ((iter-cut)/(cut*(1/stlr_cut_frac-1))))
             ηL = stlr_η_max*((1+p_frac*(stlr_ratio-1))/stlr_ratio)
 
