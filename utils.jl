@@ -5,10 +5,6 @@ Helping functions
 # Used for data loadng
 using Random
 
-# default functions outputs
-gpu!(entity) = nothing
-cpu!(entity) = nothing
-
 # Converts vector of words to vector of indices
 function indices(wordVect::Vector, vocab::Vector, unk)
     function index(x, unk)

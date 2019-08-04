@@ -7,10 +7,15 @@ import Flux: gate, tanh, σ, Tracker, params, gpu, cpu, _testmode!
 
 include("utils.jl")
 
+gpu!(entity) = nothing
+cpu!(entity) = nothing
+reset_masks!(entity) = nothing
+reset_probability!(entity) = nothing
+
 # Generates Mask
 dropMask(p, shape; alloc_func::Function=cpu, type = Float32) = alloc_func((rand(type, shape...) .> p) .* type(1/(1 - p)))
 
-#################### Weight-Dropped LSTM Cell#######################
+#################### Weight-Dropped LSTM Cell ######################
 mutable struct WeightDroppedLSTMCell{A, V, M}
     Wi::A
     Wh::A
@@ -72,7 +77,7 @@ function reset_masks!(wd::T) where T <: Flux.Recur{<:WeightDroppedLSTMCell}
 end
 ####################################################################
 
-################## ASGD Weight-Dropped LSTM Layer###################
+################## ASGD Weight-Dropped LSTM Layer ##################
 mutable struct AWD_LSTM
     layer::Flux.Recur
     T::Integer
@@ -89,11 +94,13 @@ set_trigger!(trigger_point::Integer, m::AWD_LSTM) = m.T = trigger_point;
 
 function gpu!(m::AWD_LSTM)
     m.layer = gpu(m.layer)
+    isempty(m.accum) || (m.accum = gpu(m.accum))
     return
 end
 
 function cpu!(m::AWD_LSTM)
     m.layer = cpu(m.layer)
+    isempty(m.accum) || (m.accum = cpu(m.accum))
     return
 end
 
@@ -102,18 +109,16 @@ reset_masks!(awd::AWD_LSTM) = reset_masks!(awd.layer)
 # Averaged Stochastic Gradient Descent Step
 function asgd_step!(iter, layer::AWD_LSTM)
     if iter >= layer.T
-        gpu!(layer)
-        layer.accum = gpu.(layer.accum)
-        p = params(layer)
+        p = get_trainable_params(layer)
         avg_fact = 1/max(iter - layer.T + 1, 1)
         if avg_fact != 1
             layer.accum = layer.accum .+ Tracker.data.(p)
-            Flux.loadparams!(layer, layer.accum)
+            for (ps, accum) in zip(p, lm.lstm_layer1.accum)
+                Tracker.data(ps) .= copy(avg_fact*accum))
+            end
         else
             layer.accum = deepcopy(Tracker.data.(p))   # Accumulator for ASGD
         end
-        layer.accum = cpu.(layer.accum)
-        cpu!(layer)
     end
     return
 end
@@ -203,31 +208,11 @@ function reset_masks!(de::DroppedEmbeddings)
 end
 ####################################################################
 
-# Reset's dropping probability
-function reset_probability!(new_p, m::WeightDroppedLSTMCell)
-    m.p = new_p
-    return
-end
-
-reset_probability!(new_p, m::Flux.Recur{<:WeightDroppedLSTMCell}) = reset_probability!(new_p, m.cell)
-reset_probability!(new_p, m::AWD_LSTM) = reset_probability!(new_p, m.layer.cell)
-
-function reset_probability!(new_p, m::VarDrop)
-    m.p = new_p
-    return
-end
-
-function reset_probability!(new_p, m::DroppedEmbeddings)
-    m.p = new_p
-    return
-end
-
-####################################################################
-
 """
 Concat-Pooled linear layer
 """
 
+################# Concat Pooling Dense layer #######################
 mutable struct PooledDense{F, S, T}
     W::S
     b::T
@@ -264,3 +249,18 @@ function cpu!(l::Union{PooledDense, Flux.Dense})
 end
 
 ####################################################################
+
+# Get the trainable params in the given layers
+function get_trainable_params(layers)
+    p = []
+    function get_awd_params(awd::AWD_LSTM)
+        return [awd.layer.cell.Wi,
+        awd.layer.cell.Wh,
+        awd.layer.cell.b]
+    end
+    for layer in layers
+        layer isa AWD_LSTM && (append!(p, get_awd_params(layer)); continue)
+        push!(p, layer)
+    end
+    return params(p...)
+end

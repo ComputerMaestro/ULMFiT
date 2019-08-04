@@ -67,15 +67,19 @@ end
 grad_clipping(g, upper_bound) = min(g, upper_bound)
 
 # Backward
-function back!(p::Flux.Params, l, opt, gradient_clip::Float64)
+function back!(layers, l, opt, gradient_clip::Float64)
+    # Applying gradient clipping
     l = Tracker.hook(x -> grad_clipping(x, gradient_clip), l)
-    grads = Tracker.gradient(() -> l, p)
+
+    # Calulating gradients
+    p = get_trainable_params(layers)
+    grads = Tracker.gradient(() -> l, p
     Tracker.update!(opt, p, grads)
     return
 end
 
 # Funciton for training Language Model
-function fit!(lm::LanguageModel, model_layers=nothing; batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25,
+function pretrain_lm!(lm::LanguageModel, model_layers=nothing; batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25,
     base_lr=0.004, epochs::Integer=1, checkpoint_iter::Integer=5000)
 
     # Chain of all important layers to pass from
@@ -93,17 +97,15 @@ function fit!(lm::LanguageModel, model_layers=nothing; batchsize::Integer=64, bp
     )
 
     # Initializations
-    gen = Channel(x -> generator(x, loadCorpus(); batchsize = batchsize, bptt = bptt))
     opt = ADAM(base_lr, (0.7, 0.99))    # ADAM Optimizer
-    num_of_batches = take!(gen) # Number of mini-batches
-    T = Int(floor((num_of_batches*2)/100))   # Averaging Trigger
-    set_trigger!.(T, model_layers[[3, 5, 7]])  # Setting triggers for AWD_LSTM layers
-    p = params(model_layers)
     gpu!.(model_layers)
 
     # Pre-Training loops
     for epoch=1:epochs
-        println("\nEpoch: $epoch")
+        gen = Channel(x -> generator(x, loadCorpus(); batchsize = batchsize, bptt = bptt))
+        num_of_batches = take!(gen) # Number of mini-batches
+        T = num_of_iters-Int(floor((num_of_iters*2)/100))   # Averaging Trigger
+        set_trigger!.(T, model_layers[[3, 5, 7]])  # Setting triggers for AWD_LSTM layers
         for i=1:num_of_batches
 
             # FORWARD PROPAGATION
@@ -116,15 +118,16 @@ function fit!(lm::LanguageModel, model_layers=nothing; batchsize::Integer=64, bp
             end
 
             # ASGD Step, after Triggering
-            asgd_step!.(i, [lm.lstm_layer1,lm.lstm_layer2,lm.lstm_layer3])
+            asgd_step!.(i, [lm.lstm_layer1, lm.lstm_layer2, lm.lstm_layer3])
 
-            reset_masks!.(model_layers[1:8])
+            reset_masks!.(model_layers)
 
             println("loss: $l", " iteration number: $i")
 
             # Saving checkpoints
             if i == checkpoint_iter save_model!(lm) end
         end
+        println("\nEpoch: $epoch")
     end
 end
 

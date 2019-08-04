@@ -7,7 +7,7 @@ using Flux: Tracker
 # using CorpusLoaders
 
 cd(@__DIR__)
-include("pretrainLM.jl")    # importing LanguageModel and useful functions
+include("pretrain_lm.jl")    # importing LanguageModel and useful functions
 include("custom_layers.jl")      # importing AWD_LSTM, VarDrop and DroppedEmbeddings
 include("utils.jl")         # importing utilities
 
@@ -16,13 +16,13 @@ function discriminative_step!(layers, ηL::Float64, l, gradient_clip::Float64, o
     l = Tracker.hook(x -> grad_clipping(x, gradient_clip), l)
 
     # Gradient calculation
-    grads = Tracker.gradient(() -> l, params(layers))
+    grads = Tracker.gradient(() -> l, get_trainable_params(layers))
 
     # discriminative step
     ηl = ηL/(2.6^(length(layers)-1))
     for (layer, opt) in zip(layers, opts)
         opt.eta = ηl
-        for ps in params(layer)
+        for ps in get_trainable_params([layer])
             Tracker.update!(opt, ps, grads[ps])
         end
         ηl *= 2.6
@@ -31,8 +31,8 @@ function discriminative_step!(layers, ηL::Float64, l, gradient_clip::Float64, o
 end
 
 # Fine-Tuning Language Model
-function fineTuneLM(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25,
-        ηL::Float64=4e-3, stlr_cut_frac::Float64=0.1, stlr_η_max::Float64=0.01, stlr_ratio::Float32=32, epochs::Integer=1, checkpoint_itvl::Integer=5000)
+function fine_tune_lm!(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25,
+        ηL::Float64=4e-3, stlr_cut_frac::Float64=0.1, stlr_ratio::Float32=32, stlr_η_max::Float64=0.01, epochs::Integer=1, checkpoint_itvl::Integer=5000)
 
     model_layers = Chain(
         lm.embedding_layer,
@@ -54,9 +54,9 @@ function fineTuneLM(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, 
     for epoch=1:epochs
         gen = Channel(x -> generator(x, imdb_fine_tune_data(); batchsize=batchsize, bptt=bptt))
         num_of_iters = take!(gen)
-        T = Int(floor((num_of_iters*2)/100))
+        T = num_of_iters-Int(floor((num_of_iters*2)/100))
         set_trigger!.(T, model_layers[[3, 5, 7]])
-        cut = T * stlr_cut_frac
+        cut = num_of_iters * stlr_cut_frac
         for i=1:num_of_iters
 
             # FORWARD
@@ -71,6 +71,9 @@ function fineTuneLM(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, 
 
             # ASGD Step, after Triggering
             asgd_step!.(i, [lm.lstm_layer1,lm.lstm_layer2,lm.lstm_layer3])
+
+            # Resetting dropout masks for all the layers with DropOut or DropConnect
+            reset_masks!.(model_layers)
 
             println("loss: $l", " iteration completed: $i")
 

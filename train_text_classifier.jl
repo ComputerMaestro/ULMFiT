@@ -43,8 +43,8 @@ function loss(lm, classifier, gen)
 end
 
 # Training of classifier
-function train_classifier(lm::LanguageModel, batchsize::Integer=64, bptt::Integer=70)
-    classifier = get_classifier(lm)
+function train_classifier!(lm::LanguageModel, classes::Integer=2, hidden_layer_size::Integer=50; batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25, stlr_cut_frac::Float64=0.1, stlr_ratio::Number=32, stlr_η_max::Float64=0.01, epochs::Integer=1, checkpoint_itvl=5000)
+    classifier = get_classifier(lm, classes, hidden_layer_size)
     trainable = classifier[[1, 3, 5, 7, 9, 12]]
     opts = [ADAM(0.001, (0.7, 0.99)) for i=1:length(trainable)]
     gpu!.(classifier)
@@ -52,9 +52,9 @@ function train_classifier(lm::LanguageModel, batchsize::Integer=64, bptt::Intege
     for epoch=1:epochs
         gen = imdb_classifier_data()
         num_of_iters = take!(gen)
-        T = Int(floor((num_of_iters*2)/100))
+        T = num_of_iters-Int(floor((num_of_iters*2)/100))
         set_trigger!.(T, [lm.lstm_layer1, lm.lstm_layer2, lm.lstm_layer3])
-        cut = T * stlr_cut_frac
+        cut = num_of_iters * stlr_cut_frac
         for iter=1:num_of_iters
             l = loss(lm, classifier, gen)
 
@@ -67,6 +67,8 @@ function train_classifier(lm::LanguageModel, batchsize::Integer=64, bptt::Intege
 
             # ASGD Step
             asgd_step!.(iter, [lm.lstm_layer1, lm.lstm_layer2, lm.lstm_layer3])
+
+            reset_masks!.(classifier)
 
             println("loss:", l, "epoch: ", epoch, "iteration: ", iter)
         end
