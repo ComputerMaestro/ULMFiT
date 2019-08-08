@@ -3,8 +3,9 @@ ASGD Weight-Dropped LSTM
 """
 
 using Flux
-import Flux: gate, tanh, σ, Tracker, params, gpu, cpu, _testmode!
+import Flux: gate, tanh, σ, Tracker, params, gpu, cpu, _testmode!, rand!, _dropout_kernel
 
+cd(@__DIR__)
 include("utils.jl")
 
 gpu!(entity) = nothing
@@ -13,7 +14,14 @@ reset_masks!(entity) = nothing
 reset_probability!(entity) = nothing
 
 # Generates Mask
-dropMask(p, shape; alloc_func::Function=cpu, type = Float32) = alloc_func((rand(type, shape...) .> p) .* type(1/(1 - p)))
+function drop_mask(x, p)
+    y = similar(x, size(x))
+    rand!(y)
+    y .= _dropout_kernel.(y, p, 1 - p)
+    return y
+end
+
+drop_mask(shape::Tuple, p; type = Float32) = (mask = rand(type, shape...);mask .= _dropout_kernel.(mask, p, 1 - p))
 
 #################### Weight-Dropped LSTM Cell ######################
 mutable struct WeightDroppedLSTMCell{A, V, M}
@@ -37,8 +45,8 @@ function WeightDroppedLSTMCell(in::Integer, out::Integer, probability::Float64=0
         param(zeros(Float32, out)),
         param(zeros(Float32, out)),
         probability,
-        dropMask(probability, (out*4, in)),
-        dropMask(probability, (out*4, out)),
+        drop_mask((out*4, in), probability),
+        drop_mask((out*4, out), probability),
         true
     )
     cell.b.data[gate(out, 2)] .= 1
@@ -71,8 +79,8 @@ function WeightDroppedLSTM(a...; kw...)
 end
 
 function reset_masks!(wd::T) where T <: Flux.Recur{<:WeightDroppedLSTMCell}
-    wd.cell.maskWi = (typeof(wd.cell.maskWi) <: Array) ? dropMask(wd.cell.p, size(wd.cell.Wi)) : gpu(dropMask(wd.cell.p, size(wd.cell.Wi)))
-    wd.cell.maskWh = (typeof(wd.cell.maskWh) <: Array) ? dropMask(wd.cell.p, size(wd.cell.Wh)) : gpu(dropMask(wd.cell.p, size(wd.cell.Wh)))
+    wd.cell.maskWi = drop_mask(wd.cell.Wi, wd.cell.p)
+    wd.cell.maskWh = drop_mask(wd.cell.Wh, wd.cell.p)
     return
 end
 ####################################################################
@@ -109,12 +117,12 @@ reset_masks!(awd::AWD_LSTM) = reset_masks!(awd.layer)
 # Averaged Stochastic Gradient Descent Step
 function asgd_step!(iter, layer::AWD_LSTM)
     if iter >= layer.T
-        p = get_trainable_params(layer)
+        p = get_trainable_params([layer])
         avg_fact = 1/max(iter - layer.T + 1, 1)
         if avg_fact != 1
             layer.accum = layer.accum .+ Tracker.data.(p)
-            for (ps, accum) in zip(p, lm.lstm_layer1.accum)
-                Tracker.data(ps) .= copy(avg_fact*accum))
+            for (ps, accum) in zip(p, layer.accum)
+                Tracker.data(ps) .= avg_fact*accum
             end
         else
             layer.accum = deepcopy(Tracker.data.(p))   # Accumulator for ASGD
@@ -132,22 +140,23 @@ Variational Dropout
 mutable struct VarDrop{F}
     p::F
     mask
+    reset::Bool
     active::Bool
-    VarDrop(probability::Float64=0.0) = new{AbstractFloat}(probability, Array{Float32, 2}(UndefInitializer(), 0, 0), true)
+    VarDrop(probability::Float64=0.0) = new{typeof(probability)}(probability, Array{Float32, 2}(UndefInitializer(), 0, 0), true, true)
 end
 
 function (vd::VarDrop)(inp)
-    vd.active || inp
-    !(size(inp) == size(vd.mask)) && (vd.mask = (isdefined(Main, :CuArray) && !(inp isa Array)) ? dropMask(vd.p, size(inp); alloc_func=gpu) : dropMask(vd.p, size(inp)))
-    inp .* vd.mask
+    vd.active || return inp
+    if vd.reset
+        vd.mask = drop_mask(inp, vd.p)
+        vd.reset = false
+    end
+    return inp .* vd.mask
 end
 
 _testmode!(vd::VarDrop, test) = (vd.active = !test)
 
-function reset_masks!(vd::VarDrop)
-    vd.mask = (typeof(vd.mask) <: Array) ? dropMask(vd.p, size(vd.mask)) : gpu(dropMask(vd.p, size(vd.mask)))
-    return
-end
+reset_masks!(vd::VarDrop) = (vd.reset = true;)
 
 function gpu!(vd::VarDrop)
     vd.mask = gpu(vd.mask);
@@ -165,21 +174,23 @@ Embeddings with varitional dropout
 """
 
 ################# Varitional Dropped Embeddings ####################
-mutable struct DroppedEmbeddings{A}
+mutable struct DroppedEmbeddings{F}
     emb::TrackedArray
-    p::Float64
-    mask::A
+    p::F
+    mask
     active::Bool
 end
 
-DroppedEmbeddings(in::Integer, embed_size::Integer, probability::Float64=0.0;
-    init = Flux.glorot_uniform) =
-        DroppedEmbeddings{AbstractArray}(
+function DroppedEmbeddings(in::Integer, embed_size::Integer, probability::Float64=0.0;
+    init = Flux.glorot_uniform)
+        de = DroppedEmbeddings{typeof(probability)}(
             param(init(in, embed_size)),
             probability,
-            dropMask(probability, (in, 1)),
+            drop_mask((in, embed_size), probability),
             true
         )
+    return de
+end
 
 function (de::DroppedEmbeddings)(in::AbstractArray, tying::Bool=false)
     dropped = de.active ? de.emb .* de.mask : de.emb
@@ -203,7 +214,7 @@ function cpu!(de::DroppedEmbeddings)
 end
 
 function reset_masks!(de::DroppedEmbeddings)
-    de.mask = (typeof(de.mask) <: Array) ? dropMask(de.p, size(de.mask)) : gpu(dropMask(de.p, size(de.mask)))
+    de.mask = drop_mask(de.emb, de.p)
     return
 end
 ####################################################################
@@ -231,21 +242,9 @@ Flux.@treelike PooledDense
 function (a::PooledDense)(in)
     maxpool = max.(in...)
     meanpool = mean.(in...)
-    hc = cat(in[end], maxpool, meanpool)
+    hc = cat(in[end], maxpool, meanpool, dims=1)
     W, b, σ = a.W, a.b, a.σ
     σ.(W*hc .+ b)
-end
-
-function gpu!(l::Union{PooledDense, Flux.Dense})
-    l.W = gpu(l.W)
-    l.b = gpu(l.b)
-    return
-end
-
-function cpu!(l::Union{PooledDense, Flux.Dense})
-    l.W = cpu(l.W)
-    l.b = cpu(l.b)
-    return
 end
 
 ####################################################################

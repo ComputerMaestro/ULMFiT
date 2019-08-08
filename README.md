@@ -8,8 +8,8 @@ Checkout these [blogs](https://nextjournal.com/ComputerMaestro) for better under
 
 These steps are necessary to starting training ULMFiT for any task. For pretraining step for Language model, a general-purpose corpus is needed, which here is WikiText-103 by default. Similarly, for fine-tuning Language Model and fine-tuning classifier we need a dataset for the specific task (example Sentiment Analysis, Topic classification etc). For all of these steps, the data is to be loaded for training and for that data loaders are to be defined. Since the data used to train for such a large model is large, so it is not recommended to load all the data at once, instead the data should be loaded in batches through tasks concept of julia (Refer [this](https://docs.julialang.org/en/v1.0/manual/control-flow/#man-tasks-1) documentation) using `Channels`. Basically, we need to create `Channels` which supply a mini-batch at every call.
 
-Before dividing the tokenized corpus into batches, first preprocess the corpus properly according to the vocabulary used for the model. Try to reduce the number of UNKNOWN tokens as much as possible by splitting tokens like "necessity." to "necessity" and "." , "name"" to "name" and """, "hall's" to "hall" and "'s'" etc. it is necessary to look into the tokenized corpus to reduce such words, otherwise, excess of these UNKNOWN tokens will lead to improper learning of model.
-Apart from this, apply standard techniques for text preprocessing depending on your requirements. Also, to ensure whether the model is learning is correctly or not Sampling should be done after every epoch or a after a descent number of iterations are completed. A `sampling` function is provided for the same:
+Before dividing the tokenized corpus into batches, first preprocess the corpus properly according to the vocabulary used for the model. Try to reduce the number of UNKNOWN tokens as much as possible by splitting tokens like "necessity." to "necessity" and "." , "name"" to "name" and """, "hall's" to "hall" and "'s'" etc. it is necessary to look into the tokenized corpus to reduce such words, otherwise, excess of such tokens will lead to increase in the count of UNKNOWN tokens which eventually would result in improper learning of model. Also, it is essential to use lower casing if there is no special token defined in vocabulary of model to specify upper cased words to the model.
+Apart from this, apply standard techniques for text preprocessing depending on your requirements. Also, to ensure whatever the model is learning is correct for checking on validation set or else Sampling should be done after every epoch or a after a descent number of iterations. A `sampling` function is provided for the same:
 
 ```julia
 julia> sampling(starting_text::String, lm::LanguageModel)
@@ -36,10 +36,10 @@ julia> y = ["is", "an", "example", "sequence", "."]
 This is just an example of a simple `x` and  `y` set, in practical `X` will be a `Vector` of `Vector`s (a mini-batch) where each `Vector` length will be equal to batchsize and it will contain the words for one timestep of all sequences in that mini-batch and it's succeeding vector will contain the words for next timestep of all the corresponding sequences. Similarly, `Y` will also be a `Vector` of `Vector`s but it will start from the second `Vector` in `X` and end at the next succeeding `Vector` of words for the last timestep in the `X`. For example:
 
 ```julia
-julia> gen = Channel(x -> generator(x, loadCorpus(); batchsize = 4, bptt = 10));
+julia> gen = load_wikitext_103(4, 10)     # Loads WikiText-103 and outputs a Channel to give a mini-batch(of given batchsize and bptt) at each call
 Channel{Any}(sz_max:0,sz_curr:1)
 
-julia> num_of_batches = take!(gen);      # here the first thing that generator gives is number of batches which it can give
+julia> num_of_batches = take!(gen);      # here the first thing that generator gives is number of batches which it can output
 
 julia> X = take!(gen)
 10-element Array{Array{Any,1},1}:
@@ -76,7 +76,7 @@ For Fine-tuning of Classifier, the format of `X` will not change but now since t
 ### Step 1 - Pre-training Language Model
 
 Checkout [blog1](https://nextjournal.com/ComputerMaestro/jsoc19-practical-implementation-of-ulmfit-for-text-clasification) and [blog2](https://nextjournal.com/ComputerMaestro/jsoc19-practical-implementation-of-ulmfit-in-julia-2) for the conceptual understanding of this step.
-The repo contains `pretrainLM.jl` file pre-training a Language model from scratch based on given corpus. Here, the corpus pre-processed in the above step is used here to train the language model. (Refer this [blog](https://nextjournal.com/ComputerMaestro/jsoc19-practical-implementation-of-ulmfit-in-julia-2) for batchsize and bptt understanding).
+The repo contains `pretrain_lm.jl` file pre-training a Language model from scratch based on given corpus. Here, the corpus pre-processed in the above step is used here to train the language model. (Refer this [blog](https://nextjournal.com/ComputerMaestro/jsoc19-practical-implementation-of-ulmfit-in-julia-2) for batchsize and bptt understanding).
 
 #### To start training run:
 
@@ -139,6 +139,21 @@ Keyword Arguments:
  * `epochs`           : It is simply the number of epochs for which the language model is to be fine-tuned
  * `checkpoint_itvl`  : Stands for Checkpoint interval, interval of number of iterations after which the model weights are saved to a specified BSON file
 
+For Sentiment analysis with IMDB dataset, `imdb_fine_tune_data` funciton is provided to load data for Fine-tuning Language Model:
+
+```julia
+# This outputs a generator same as used for pre-training of language model
+# The data given by this generator is from the `unsup` part of the IMDB dataset (refer README of the IMDB)
+julia> ft_gen = imdb_fine_tune_data(4, 10)
+Channel{Any}(sz_max:0,sz_curr:1)
+```
+
+Arguments:
+
+ * `batchsize`    : Number of sequences passing at a time
+ * `bptt`         : Number of tokens in each sequence of mini-batch
+ * `num_examples` : (optional) Number of examples to be taken from all unsup examples of IMDB dataset
+
 ### Step 3 - Fine-tuning the classifier for downstream task
 
 Checkout this [blog](https://nextjournal.com/ComputerMaestro/jsoc19-practical-implementation-of-ulmfit-in-julia-4) for better conceptual understanding of this step.
@@ -175,4 +190,11 @@ Keyword Arguments:
 * `epochs`           : It is simply the number of epochs for which the language model is to be fine-tuned
 * `checkpoint_itvl`  : Stands for Checkpoint interval, interval of number of iterations after which the model weights are saved to a specified BSON file
 
-By Default the Text Classifier gets fine-tuned for the sentiment analysis file.
+By Default the Text Classifier can be fine-tuned for the sentiment analysis task.
+To train it for the sentiment analysis with IMDB dataset, `imdb_classifier_data` function is provided to load the training examples of the IMDB dataset:
+
+```julia
+# This funciton outputs a Channel, which outputs ont example at a time
+# Example can be negative or positive randomly
+julia> classifier_data_gen = imdb_classifier_data()
+```

@@ -63,6 +63,7 @@ function fine_tune_lm!(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=7
             l = loss(lm, model_layers, gen)
 
             # Slanted triangular learning rate step
+            t = i + (epoch-1)*num_of_iters
             p_frac = (i < cut) ? i/cut : (1 - ((i-cut)/(cut*(1/stlr_cut_frac-1))))
             ηL = stlr_η_max*((1+p_frac*(stlr_ratio-1))/stlr_ratio)
 

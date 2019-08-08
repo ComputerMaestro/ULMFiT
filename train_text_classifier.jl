@@ -2,40 +2,47 @@
 ULMFiT - Text Classifier
 """
 
+cd(@__DIR__)
 include("custom_layers.jl")     # including custome layers created for ULMFiT model
 include("utils.jl")     # including utilities
-include("fineTuneLM.jl")        # including useful functions from fine-tuning file
+include("fine_tune_lm.jl")        # including useful functions from fine-tuning file
 
-# Get classfier layers in a chain
-function get_classifier(lm::LanguageModel=load_model!(), clsfr_out_sz::Integer=2, clsfr_hidden_sz::Integer=50)
-    return Chain(
-        lm.embedding_layer,
-        VarDrop(lm.wordDropProb),
-        lm.lstm_layer1,
-        VarDrop(lm.LayerDropProb),
-        lm.lstm_layer2,
-        VarDrop(lm.LayerDropProb),
-        lm.lstm_layer3,
-        VarDrop(lm.FinalDropProb),
-        PooledDense(length(lm.lstm_layer3.layer.cell.h), clsfr_hidden_sz, relu),
-        BatchNorm(clsfr_hidden_sz, relu),
-        Dropout(clsfr_hidden_drop),
-        Dense(clsfr_hidden_sz, clsfr_out_sz),
-        softmax
+mutable struct TextClassifier
+    rnn_layers::Flux.Chain
+    linear_layers::Flux.Chain
+end
+
+function TextClassifier(lm::LanguageModel=load_model!(), clsfr_out_sz::Integer=1, clsfr_hidden_sz::Integer=50, clsfr_hidden_drop::Float64=0.0)
+    return TextClassifier(Chain(
+            lm.embedding_layer,
+            VarDrop(lm.wordDropProb),
+            lm.lstm_layer1,
+            VarDrop(lm.LayerDropProb),
+            lm.lstm_layer2,
+            VarDrop(lm.LayerDropProb),
+            lm.lstm_layer3,
+            VarDrop(lm.FinalDropProb)),
+        Chain(
+            gpu(PooledDense(length(lm.lstm_layer3.layer.cell.h), clsfr_hidden_sz, relu)),
+            gpu(BatchNorm(clsfr_hidden_sz, relu)),
+            Dropout(clsfr_hidden_drop),
+            gpu(Dense(clsfr_hidden_sz, clsfr_out_sz)),
+            softmax
+        )
     )
 end
 
 # Forward step for classifier
-function forward(lm, encoder, decoder, gen)
-    batch = broadcast(x -> gpu(encoder[1](indices(x, lm.vocab, "_unk_"))), batch)
-    batch = encoder[2:end].(batch)
-    batch = decoder(batch)
+function forward(lm, classifier, gen)
+    batch = broadcast(x -> gpu(classifier.rnn_layers[1](indices(x, lm.vocab, "_unk_"))), batch)
+    batch = classifier.rnn_layers[2:end].(batch)
+    batch = classifier.linear_layers(batch)
     return batch
 end
 
 # Loss function for classifier
 function loss(lm, classifier, gen)
-    H = forward(lm, classifier[1:8], classifier[9:end], take!(gen))
+    H = forward(lm, classifier.rnn_layers, take!(gen))
     Y = gpu.(take!(gen))
     l = sum(crossentropy.(H, Y))
     Flux.reset!(model_layers)
@@ -43,11 +50,12 @@ function loss(lm, classifier, gen)
 end
 
 # Training of classifier
-function train_classifier!(lm::LanguageModel, classes::Integer=2, hidden_layer_size::Integer=50; batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25, stlr_cut_frac::Float64=0.1, stlr_ratio::Number=32, stlr_η_max::Float64=0.01, epochs::Integer=1, checkpoint_itvl=5000)
-    classifier = get_classifier(lm, classes, hidden_layer_size)
-    trainable = classifier[[1, 3, 5, 7, 9, 12]]
+function train_classifier!(lm::LanguageModel, classifier::TextClassifier=TextClassifier(lm), classes::Integer=2, hidden_layer_size::Integer=50; batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25, stlr_cut_frac::Float64=0.1, stlr_ratio::Number=32, stlr_η_max::Float64=0.01, epochs::Integer=1, checkpoint_itvl=5000)
+    trainable = []
+    append!(trainable, [classifier.rnn_layers[[1, 3, 5, 7]]...])
+    append!(trainable, [classifier.linear_layers[[1, 4]]...])
     opts = [ADAM(0.001, (0.7, 0.99)) for i=1:length(trainable)]
-    gpu!.(classifier)
+    gpu!.(classifier.rnn_layers)
 
     for epoch=1:epochs
         gen = imdb_classifier_data()
@@ -59,6 +67,7 @@ function train_classifier!(lm::LanguageModel, classes::Integer=2, hidden_layer_s
             l = loss(lm, classifier, gen)
 
             # Slanted triangular learning rates
+            t = iter + (epoch-1)*num_of_iters
             p_frac = (iter < cut) ? iter/cut : (1 - ((iter-cut)/(cut*(1/stlr_cut_frac-1))))
             ηL = stlr_η_max*((1+p_frac*(stlr_ratio-1))/stlr_ratio)
 
@@ -68,7 +77,7 @@ function train_classifier!(lm::LanguageModel, classes::Integer=2, hidden_layer_s
             # ASGD Step
             asgd_step!.(iter, [lm.lstm_layer1, lm.lstm_layer2, lm.lstm_layer3])
 
-            reset_masks!.(classifier)
+            reset_masks!.(classifier.rnn_layers)
 
             println("loss:", l, "epoch: ", epoch, "iteration: ", iter)
         end

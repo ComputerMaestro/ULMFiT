@@ -57,7 +57,7 @@ end
 # loss funciton - Loss calculation with AR and TAR regulatization
 function loss(lm, model_layers, gen)
     H = forward(lm, model_layers, take!(gen))
-    Y = broadcast(x -> Flux.onehotbatch(x, lm.vocab, "_unk_"), take!(gen))
+    Y = broadcast(x -> gpu(Flux.onehotbatch(x, lm.vocab, "_unk_")), take!(gen))
     l = sum(crossentropy.(H, Y))
     Flux.truncate!(model_layers)
     return l
@@ -73,7 +73,7 @@ function back!(layers, l, opt, gradient_clip::Float64)
 
     # Calulating gradients
     p = get_trainable_params(layers)
-    grads = Tracker.gradient(() -> l, p
+    grads = Tracker.gradient(() -> l, p)
     Tracker.update!(opt, p, grads)
     return
 end
