@@ -32,6 +32,3 @@ function generator(c::Channel, corpus; batchsize::Integer=64, bptt::Integer=70)
         put!(c, batch[2:end])
     end
 end
-
-# custom mean function
-mean(nums...) = sum(nums)/length(nums)

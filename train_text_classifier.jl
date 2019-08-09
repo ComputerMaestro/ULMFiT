@@ -6,6 +6,7 @@ cd(@__DIR__)
 include("custom_layers.jl")     # including custome layers created for ULMFiT model
 include("utils.jl")     # including utilities
 include("fine_tune_lm.jl")        # including useful functions from fine-tuning file
+include("data_loaders.jl")      # including helper functions for IMDB data loading
 
 mutable struct TextClassifier
     rnn_layers::Flux.Chain
@@ -33,36 +34,52 @@ function TextClassifier(lm::LanguageModel=load_model!(), clsfr_out_sz::Integer=1
 end
 
 # Forward step for classifier
-function forward(lm, classifier, gen)
-    batch = broadcast(x -> gpu(classifier.rnn_layers[1](indices(x, lm.vocab, "_unk_"))), batch)
-    batch = classifier.rnn_layers[2:end].(batch)
-    batch = classifier.linear_layers(batch)
-    return batch
+function forward(lm, classifier, gen; now_per_pass::Integer=128)
+    X = take!(gen)
+    l = length(X)
+    H, maxpools, meanpools = [], [], []
+    for i=1:(ceil(l/now_per_pass)-1 + (!isequal(l%now_per_pass, 0)))
+        H = broadcast(x -> gpu(classifier.rnn_layers[1](indices([x], lm.vocab, "_unk_"))), X[1:now_per_pass])
+        H = classifier.rnn_layers[2:end].(H)
+        H = cat(H..., dims=3)
+        push!(maxpools, Tracker.data(maximum(H, dims=3)[:, :, 1]))
+        push!(meanpools, Tracker.data((sum(H, dims=3)/size(H, 3))[:, :, 1]))
+        X = X[now_per_pass+1:end]
+        Flux.truncate!(classifier.rnn_layers)
+    end
+    H = broadcast(x -> gpu(classifier.rnn_layers[1](indices([x], lm.vocab, "_unk_"))), X)
+    H = classifier.rnn_layers[2:end].(H)
+    append!(maxpools, H)
+    append!(meanpools, maxpools)
+    H = meanpools
+    H = classifier.linear_layers(H)
+    return H
 end
 
 # Loss function for classifier
 function loss(lm, classifier, gen)
-    H = forward(lm, classifier.rnn_layers, take!(gen))
-    Y = gpu.(take!(gen))
-    l = sum(crossentropy.(H, Y))
-    Flux.reset!(model_layers)
+    H = forward(lm, classifier, gen)
+    Y = gpu(take!(gen))
+    l = crossentropy(H, Y)
+    Flux.reset!(classifier)
     return l
 end
 
 # Training of classifier
-function train_classifier!(lm::LanguageModel, classifier::TextClassifier=TextClassifier(lm), classes::Integer=2, hidden_layer_size::Integer=50; batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25, stlr_cut_frac::Float64=0.1, stlr_ratio::Number=32, stlr_η_max::Float64=0.01, epochs::Integer=1, checkpoint_itvl=5000)
+function train_classifier!(lm::LanguageModel, classifier::TextClassifier=TextClassifier(lm), classes::Integer=1, hidden_layer_size::Integer=50, data_loader::Channel=imdb_classifier_data;
+    batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25, stlr_cut_frac::Float64=0.1, stlr_ratio::Number=32, stlr_η_max::Float64=0.01, epochs::Integer=1, checkpoint_itvl=5000)
     trainable = []
     append!(trainable, [classifier.rnn_layers[[1, 3, 5, 7]]...])
     append!(trainable, [classifier.linear_layers[[1, 4]]...])
     opts = [ADAM(0.001, (0.7, 0.99)) for i=1:length(trainable)]
+    cut = num_of_iters * epochs * stlr_cut_frac
     gpu!.(classifier.rnn_layers)
 
     for epoch=1:epochs
-        gen = imdb_classifier_data()
+        gen = data_loader()
         num_of_iters = take!(gen)
         T = num_of_iters-Int(floor((num_of_iters*2)/100))
         set_trigger!.(T, [lm.lstm_layer1, lm.lstm_layer2, lm.lstm_layer3])
-        cut = num_of_iters * stlr_cut_frac
         for iter=1:num_of_iters
             l = loss(lm, classifier, gen)
 

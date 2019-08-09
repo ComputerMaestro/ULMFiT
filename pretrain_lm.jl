@@ -79,7 +79,7 @@ function back!(layers, l, opt, gradient_clip::Float64)
 end
 
 # Funciton for training Language Model
-function pretrain_lm!(lm::LanguageModel, model_layers=nothing; batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25,
+function pretrain_lm!(lm::LanguageModel, model_layers=nothing; batchsize::Integer=64, bptt::Integer=70, data_loader::Channel=load_wikitext_103, gradient_clip::Float64=0.25,
     base_lr=0.004, epochs::Integer=1, checkpoint_iter::Integer=5000)
 
     # Chain of all important layers to pass from

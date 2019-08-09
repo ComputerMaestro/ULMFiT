@@ -240,11 +240,11 @@ end
 Flux.@treelike PooledDense
 
 function (a::PooledDense)(in)
-    in = cat(in..., dims=3)
-    maxpool = maximum.(in, dims=3)[:, :, 1]
-    meanpool = sum(in, dims=3)/size(in, 3)[:, :, 1]
-    hc = cat(in[:, :, 1], maxpool, meanpool, dims=1)
     W, b, σ = a.W, a.b, a.σ
+    in = cat(in..., dims=3)
+    maxpool = maximum(in, dims=3)[:, :, 1]
+    meanpool = (sum(in, dims=3)/size(in, 3))[:, :, 1]
+    hc = cat(in[:, :, 1], maxpool, meanpool, dims=1)
     σ.(W*hc .+ b)
 end
 

@@ -31,7 +31,7 @@ function discriminative_step!(layers, ηL::Float64, l, gradient_clip::Float64, o
 end
 
 # Fine-Tuning Language Model
-function fine_tune_lm!(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, gradient_clip::Float64=0.25,
+function fine_tune_lm!(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, data_loader::Channel=imdb_fine_tune_data, gradient_clip::Float64=0.25,
         ηL::Float64=4e-3, stlr_cut_frac::Float64=0.1, stlr_ratio::Float32=32, stlr_η_max::Float64=0.01, epochs::Integer=1, checkpoint_itvl::Integer=5000)
 
     model_layers = Chain(
@@ -48,15 +48,15 @@ function fine_tune_lm!(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=7
     )
 
     opts = [ADAM(0.001, (0.7, 0.99)) for i=1:4]
+    cut = num_of_iters * epochs * stlr_cut_frac
     gpu!.(model_layers)
 
     # Fine-Tuning loops
     for epoch=1:epochs
-        gen = Channel(x -> generator(x, imdb_fine_tune_data(); batchsize=batchsize, bptt=bptt))
+        gen = data_loader()
         num_of_iters = take!(gen)
         T = num_of_iters-Int(floor((num_of_iters*2)/100))
         set_trigger!.(T, model_layers[[3, 5, 7]])
-        cut = num_of_iters * stlr_cut_frac
         for i=1:num_of_iters
 
             # FORWARD

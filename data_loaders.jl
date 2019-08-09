@@ -30,7 +30,7 @@ function imdb_preprocess(text::AbstractString)
     text = replace(text, "<br /><br />" => '\n')
     text = replace(text, "<br />" => '\n')
     tokens = intern.(lowercase.(tokenize(text)))
-    for symbol in [',', '.', '-', '"', '/', '<', '>', "'s", "`s"]
+    for symbol in [',', '.', '-', '/', "'s"]
         tokens = split_word.(tokens, symbol)
         temp = []
         for token in tokens
@@ -80,7 +80,7 @@ function imdb_classifier_data()
                 cur_text = read(fileio, String)
                 tokens = imdb_preprocess(cur_text)
                 put!(docs, tokens)
-                put!(docs, parse(Int, split(path, '_')[2][1:end-4]))
+                put!(docs, [parse(Int, split(path, '_')[2][1:end-4])])
             end #open
         end #for
     end #channel
