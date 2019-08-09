@@ -13,7 +13,8 @@ include("WikiText-103")
 
 # this custom preprocessing is based on the observation on the IMDB dataset
 # these preprocessings will significantly reduce the "_unk_" (UNKNOWN) tokens in the corpus
-function imdb_preprocess(tokens::Vector{String})
+function imdb_preprocess(text::AbstractString)
+    ## Edit here if any preprocessing step is needed ##
     function put(en, symbol)
         l = length(en)
         (l == 1) && return en
@@ -22,21 +23,26 @@ function imdb_preprocess(tokens::Vector{String})
         end
         return en
     end
+    function split_word(word, symbol)
+        length(word) == 1 && return [word]
+        return split(word, symbol)
+    end
+    text = replace(text, "<br /><br />" => '\n')
+    text = replace(text, "<br />" => '\n')
+    tokens = intern.(lowercase.(tokenize(text)))
     for symbol in [',', '.', '-', '"', '/', '<', '>', "'s", "`s"]
-        tokens = split.(tokens, symbol)
+        tokens = split_word.(tokens, symbol)
         temp = []
         for token in tokens
             try
-                append!(temp, put(token, "´s"))
+                append!(temp, put(token, symbol))
             catch
                 append!(temp, token)
             end
         end
         tokens = temp
     end
-    temp = [((tokens[idx-1] == "<") && ((tokens[idx+1] == ">") || (tokens[idx+2] == ">"))) && append!(temp, idx-1:idx+2) for idx in findall(isequal("br"), tokens)]
-    deleteat!(tokens, temp)
-    deleteat!(tokens, findall(isequal("")||isequal(" "), tokens))
+    deleteat!(tokens, findall(x -> isequal(x, "")||isequal(x, " "), tokens))
     return tokens
 end
 
@@ -56,11 +62,9 @@ function imdb_fine_tune_data(batchsize::Integer, bptt::Integer, num_examples::In
     for path in imdb_dataset.filepaths   #extract data from the files in directory and put into channel
         open(path) do fileio
             cur_text = read(fileio, String)
-            [append!(dataset, intern.(tokenize(sent))) for sent in split_sentences(cur_text)]
+            append!(dataset, imdb_preprocess(cur_text))
         end #open
     end #for
-    ## Edit here if any preprocessing step is needed ##
-    dataset = imdb_preprocess(dataset)
     return Channel(x -> generator(x, dataset; batchsize=batchsize, bptt=bptt))
 end
 
@@ -74,10 +78,9 @@ function imdb_classifier_data()
         for path in filepaths   #extract data from the files in directory and put into channel
             open(path) do fileio
                 cur_text = read(fileio, String)
-                tokens = intern.(tokenize(vcat(split_sentences(cur_text))))
-                tokens = imdb_preprocess(tokens)
+                tokens = imdb_preprocess(cur_text)
                 put!(docs, tokens)
-                put!(docs, parse(Int, split(path, '_')[2]))
+                put!(docs, parse(Int, split(path, '_')[2][1:end-4]))
             end #open
         end #for
     end #channel
