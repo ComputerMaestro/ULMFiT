@@ -98,6 +98,7 @@ Flux.@treelike AWD_LSTM
 
 (m::AWD_LSTM)(in) = m.layer(in)
 
+set_trigger!(t, m) = nothing
 set_trigger!(trigger_point::Integer, m::AWD_LSTM) = m.T = trigger_point;
 
 function gpu!(m::AWD_LSTM)
@@ -115,7 +116,9 @@ end
 reset_masks!(awd::AWD_LSTM) = reset_masks!(awd.layer)
 
 # Averaged Stochastic Gradient Descent Step
-function asgd_step!(iter, layer::AWD_LSTM)
+asgd_step!(i, l) = nothing
+
+function asgd_step!(iter::Integer, layer::AWD_LSTM)
     if iter >= layer.T
         p = get_trainable_params([layer])
         avg_fact = 1/max(iter - layer.T + 1, 1)

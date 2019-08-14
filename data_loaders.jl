@@ -4,7 +4,7 @@ Default Data Loaders for ULMFiT training for Sentiment Analysis
  - IMDB movie review dataset - unsup data is used for fine-tuning Language Mode for Sentiment Analysis
  - IMDB movie review dataset - labelled data is used for training classifier for Sentiment Analysis
 """
-using CorpusLoaders
+# using CorpusLoaders
 using Random
 
 # WikiText-103 corpus loader
@@ -27,6 +27,9 @@ function imdb_preprocess(text::AbstractString)
         length(word) == 1 && return [word]
         return split(word, symbol)
     end
+    text = collect(text)
+    deleteat!(text, findall(x -> !isvalid(x), text))
+    text = join(text)
     text = replace(text, "<br /><br />" => '\n')
     text = replace(text, "<br />" => '\n')
     tokens = intern.(lowercase.(tokenize(text)))
@@ -69,19 +72,27 @@ function imdb_fine_tune_data(batchsize::Integer, bptt::Integer, num_examples::In
 end
 
 # IMDB data loader for training classifier
-function imdb_classifier_data()
+function imdb_classifier_data(batchsize::Integer)
     filepaths = IMDB("train_neg").filepaths
     append!(filepaths, IMDB("train_pos").filepaths)
     [shuffle!(filepaths) for _=1:10]
     Channel(csize=1) do docs
-        put!(docs, length(filepaths))
-        for path in filepaths   #extract data from the files in directory and put into channel
-            open(path) do fileio
-                cur_text = read(fileio, String)
-                tokens = imdb_preprocess(cur_text)
-                put!(docs, tokens)
-                put!(docs, [parse(Int, split(path, '_')[2][1:end-4])])
-            end #open
+        n_batches = Int(floor(length(filepaths)/batchsize))
+        put!(docs, n_batches)
+        for i=1:n_batches
+            X, Y = [], []
+            for j=1:batchsize
+                path = filepaths[(i-1)*batchsize+j]
+                open(path) do fileio
+                    cur_text = read(fileio, String)
+                    tokens = imdb_preprocess(cur_text)
+                    push!(X, tokens)
+                    push!(Y, Float32((parse(Int32, split(path, '_')[2][1:end-4]))/10))
+                end #open
+            end#for
+            X = pre_pad_sequences(X, "_pad_")
+            put!(docs, [Flux.batch(X[k][j] for k=1:batchsize) for j=1:length(X[1])])
+            put!(docs, Y[:, :])
         end #for
     end #channel
 end

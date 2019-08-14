@@ -3,8 +3,6 @@ ULMFiT - FINE-TUNING
 """
 
 using Flux
-using Flux: Tracker
-# using CorpusLoaders
 
 cd(@__DIR__)
 include("pretrain_lm.jl")    # importing LanguageModel and useful functions
@@ -34,33 +32,20 @@ end
 function fine_tune_lm!(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=70, data_loader::Channel=imdb_fine_tune_data, gradient_clip::Float64=0.25,
         ηL::Float64=4e-3, stlr_cut_frac::Float64=0.1, stlr_ratio::Float32=32, stlr_η_max::Float64=0.01, epochs::Integer=1, checkpoint_itvl::Integer=5000)
 
-    model_layers = Chain(
-        lm.embedding_layer,
-        VarDrop(lm.wordDropProb),
-        lm.lstm_layer1,
-        VarDrop(lm.LayerDropProb),
-        lm.lstm_layer2,
-        VarDrop(lm.LayerDropProb),
-        lm.lstm_layer3,
-        VarDrop(lm.FinalDropProb),
-        x -> lm.embedding_layer(x, true),
-        softmax
-    )
-
     opts = [ADAM(0.001, (0.7, 0.99)) for i=1:4]
     cut = num_of_iters * epochs * stlr_cut_frac
-    gpu!.(model_layers)
+    gpu!.(lm.layers)
 
     # Fine-Tuning loops
     for epoch=1:epochs
         gen = data_loader()
         num_of_iters = take!(gen)
         T = num_of_iters-Int(floor((num_of_iters*2)/100))
-        set_trigger!.(T, model_layers[[3, 5, 7]])
+        set_trigger!.(T, lm.layers)
         for i=1:num_of_iters
 
             # FORWARD
-            l = loss(lm, model_layers, gen)
+            l = loss(lm, gen)
 
             # Slanted triangular learning rate step
             t = i + (epoch-1)*num_of_iters
@@ -68,13 +53,13 @@ function fine_tune_lm!(lm::LanguageModel; batchsize::Integer=64, bptt::Integer=7
             ηL = stlr_η_max*((1+p_frac*(stlr_ratio-1))/stlr_ratio)
 
             # Backprop with discriminative fine-tuning step
-            discriminative_step!(model_layers[[1, 3, 5, 7]], ηL, l, gradient_clip, opts)
+            discriminative_step!(lm.layers[[1, 3, 5, 7]], ηL, l, gradient_clip, opts)
 
             # ASGD Step, after Triggering
-            asgd_step!.(i, [lm.lstm_layer1,lm.lstm_layer2,lm.lstm_layer3])
+            asgd_step!.(i, lm.layers)
 
             # Resetting dropout masks for all the layers with DropOut or DropConnect
-            reset_masks!.(model_layers)
+            reset_masks!.(lm.layers)
 
             println("loss: $l", " iteration completed: $i")
 
